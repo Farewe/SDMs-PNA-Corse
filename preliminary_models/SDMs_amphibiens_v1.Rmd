@@ -1,0 +1,898 @@
+---
+title: "Amphibiens"
+author: "Boris Leroy"
+date: "`r format(Sys.time(), '%d/%m/%y')`"
+output: 
+  # word_document
+  prettydoc::html_pretty:
+    theme: architect
+    toc: yes
+    df_print: paged
+---
+
+### *Notes préalables sur ce template Rmarkdown*
+
+Ce fichier constitue un gabarit complet pour la modélisation des habitats 
+potentiels d'une espèce ou d'un groupe d'espèce. [**Il est fourni sous licence 
+libre CC-BY 4.0**.](https://creativecommons.org/licenses/by/4.0/)
+
+Vous êtes autorisé à :
+
+**Partager** — copier, distribuer et communiquer le matériel par tous moyens
+et sous tous formats pour toute utilisation, y compris commerciale.
+**Adapter** — remixer, transformer et créer à partir du matériel pour toute
+utilisation, y compris commerciale.
+L'Offrant ne peut retirer les autorisations conférées par la licence tant 
+que vous appliquez les termes de cette licence.
+
+Selon les conditions suivantes :
+
+**Attribution** — Vous devez créditer ce travail, intégrer un lien vers la 
+licence et indiquer si des modifications ont été effectuées à ce code.
+Vous devez indiquer ces informations par tous les moyens raisonnables, sans 
+toutefois suggérer que l'Offrant vous soutient ou soutient la façon dont 
+vous avez utilisé son code.
+
+**Partage dans les Mêmes Conditions** — Dans le cas où vous effectuez un 
+remix, que vous transformez, ou créez à partir du matériel composant le code
+original, vous devez diffuser le code modifié dans les même conditions,
+c'est à dire avec la même licence avec laquelle le code original a été
+diffusé.
+
+**Pas de restrictions complémentaires** — Vous n'êtes pas autorisé à 
+appliquer des conditions légales ou des mesures techniques qui 
+restreindraient légalement autrui à utiliser le code dans les conditions 
+décrites par la licence. 
+
+
+
+Il a été testé fonctionnel sur `r R.version.string`, avec
+les packages
+sf (`r packageVersion("sf")`), terra (`r packageVersion("terra")`), ggplot2 
+(`r packageVersion("ggplot2")`), scales (`r packageVersion("scales")`), egg 
+(`r packageVersion("egg")`), virtualspecies 
+(`r packageVersion("virtualspecies")`), blockCV 
+(`r packageVersion("blockCV")`), biomod2 (`r packageVersion("biomod2")`),
+dplyr (`r packageVersion("dplyr")`), tidyterra 
+(`r packageVersion("tidyterra")`). 
+
+Il est possible que des évolutions futures de packages (notamment, biomod2, qui 
+est sujet à de nombreuses évolutions en 2023 et 2024) rendent certaines parties
+du fichier non fonctionnelles, ce qui nécessitera de corriger le code.
+
+
+
+# Pré-requis :
+
+Chargement des packages et fonctions, chargement de données géographiques et
+des variables environnementales harmonisées
+
+```{r message=FALSE, warning=FALSE}
+library(sf)
+library(terra)
+library(ggplot2)
+library(scales)
+library(egg)
+library(virtualspecies)
+library(blockCV)
+library(biomod2)
+library(dplyr)
+library(tidyterra)
+source("scripts/functions.R")
+
+# Shapefile de la Corse
+corse <- st_read("data/corse.gpkg")
+# Données environnementales harmonisées
+env_corse <- rast("data/env_corse_total_sync.tif")
+```
+
+# Chargement et préparation des données d'occurrence
+
+```{r fig.height=3, fig.width=6, message=FALSE, warning=FALSE}
+amphib <- st_read("data/donnees_brutes/taxa/amphibien.shp")
+# Simplification du nom d'espèce en binomial
+amphib$species <- simplify_species_name(amphib$nom_valide)
+# Dates d'échantillonnage
+amphib$year <- as.numeric(strtrim(amphib$date_fin, 4))
+amphib$month <- as.numeric(substr(amphib$date_fin, 6, 7))
+
+# Visualisation de la temporalité des occurrences
+ggplot(amphib) +
+  geom_boxplot(aes(x = species,
+                   y = year))+ 
+  coord_flip() +
+  scale_y_continuous(breaks = breaks_pretty()) +
+  theme_minimal()
+```
+
+## Filtre temporel
+
+Il faut établir un filtre temporel pour éliminer les données imprécises, 
+sachant que l'objectif est de modéliser à une résolution assez fine, de l'ordre
+de 1km.
+Le champ `precision` est peu renseigné et donc peu utile ici, il nous faut donc
+poser une hypothèse sur les données qui sont imprécises. On peut considérer que
+les GPS ont commencé à être largement disponibles à partir de 1990, mais leur
+utilisation ne s'est généralisée qu'à partir des années 2000, notamment grâce
+à leur miniaturisation. Ainsi, on peut spéculer qu'avant les années 2000, les
+données étaient moins précisés car possiblement géolocalisées en utilisant des
+référentiels comme les lieu-dits ou les communes, tandis qu'à partir des années
+2000 la précision s'est améliorée grâce à la géolocalisation par satellite.
+
+Le nombre de données supprimées en fixant un seuil à l'année 2000 est 
+relativement faible :
+
+```{r fig.height=10, fig.width=6}
+# Les données avant 2000 ne représentent qu'un petit % du jeu de données : 
+100 * length(which(amphib$year < 2000)) / nrow(amphib)
+```
+
+Les données post-2000 sont également plus complètes et homogènes en termes de
+couverture temporelle dans l'année :
+
+```{r fig.height=10, fig.width=10}
+ggplot(amphib) +
+  geom_boxplot(aes(x = species,
+                   y = month)) +
+  facet_wrap(~year) + 
+  coord_flip() +
+  scale_y_continuous(breaks = breaks_pretty()) +
+  theme_minimal()
+```
+
+L'emprise spatiale des données d'occurrence ne change pas de manière majeure 
+avec ou sans les données pré-2000 :
+
+```{r fig.height=7, fig.width=10}
+
+p_amphib_all <- ggplot() +
+  geom_sf(data = corse) +
+  geom_sf(data = amphib, aes(col = year)) +
+  scale_color_continuous(type = "viridis") + 
+  theme_minimal(base_size = 15) +
+  ggtitle("Toutes données\namphibiens")
+
+p_amphib_post2000 <- ggplot() +
+  geom_sf(data = corse) +
+  geom_sf(data = amphib[amphib$year >= 2000, ], aes(col = year)) +
+  scale_color_continuous(type = "viridis") + 
+  theme_minimal(base_size = 15) +
+  ggtitle("Données post-2000\namphibiens")
+
+ggarrange(p_amphib_all,
+          p_amphib_post2000,
+          nrow = 1)
+```
+
+On pose donc l'hypothèse raisonnable qu'un filtre à 2000 va assurer une bonne 
+précision dans la localisation des occurrences sans perdre d'information
+critique sur la répartition des espèces.
+
+```{r}
+amphib <- amphib[which(amphib$year >= 2000), ]
+```
+
+## Rasterisation des occurrences
+
+L'objectif ici est de ne garder qu'une occurrence par cellule à la résolution 
+de nos variables environnementales afin d'éviter une forme extrême de
+pseudo-réplication.
+
+```{r}
+# On rasterise les occurrences à la résolution de nos variables 
+# environnementales
+amphib_r <- rasterize(amphib, 
+                      env_corse)
+names(amphib_r) <- "amphib"
+
+plot(amphib_r)
+```
+
+
+On va ensuite éliminer les occurrence qui sont dans des zones sans 
+valeurs de variables environnementales. Pour cela on va combiner les variables
+environnementales avec les occurrences rasterisées dans un `data.frame`, et 
+supprimer les occurrences d'espèces qui tombent sur des données 
+environnementales manquantes
+
+```{r}
+# On crée un stack avec nos occurrences rasterisées et les variables env
+env_amphib <- c(env_corse,
+                amphib_r)
+
+# On récupère les coordonnées XY de toutes les cellules, pour préparer nos
+# données finales
+coorXY <- xyFromCell(env_corse, 
+                     1:ncell(env_corse))
+# On transforme le raster en data.frame 
+env_amphib_df <- values(env_amphib)
+
+# On regarde le nombre d'occurrences pour lesquelles il y a des données 
+# manquantes : 
+length(which(is.na(env_amphib_df[, "bio1"]) & 
+               !is.na(env_amphib_df[, "amphib"])))
+```
+
+On va maintenant supprimer les cellules pour lesquelles on n'a pas de données
+environnementales. Pour cela on va utiliser la première variable
+environnementale ici, car les données manquantes sont toutes les mêmes
+entre toutes les variables environnementales (cf. script harmonisation des
+données).
+
+
+```{r}
+# On filtre d'abord sur l'objet qui contient les coordonnées
+coorXY <- coorXY[-which(is.na(env_amphib_df[, 1])), ]
+# Et ensuite sur le tableau avec variables env et présences d'espèces
+env_amphib_df <- env_amphib_df[-which(is.na(env_amphib_df[, 1])), ]
+
+# Comparaison du nombre d'occurrences :
+# Avant rasterisation
+nrow(amphib)
+
+# Après rasterisation et élimination des données env manquantes
+length(which(env_amphib_df[, "amphib"] == 1))
+```
+
+Il s'agit donc du nombre d'occurrences que l'on va pouvoir utiliser pour 
+calibrer nos modèles. On va maintenant formater ces occurrences en combinant
+coordonnées et info sur l'occurrence dans un `data.frame` pour préparer la
+calibration de nos modèles
+
+```{r}
+P_points <- data.frame(
+  # D'abord on récupère les coordonnées XY qui correspondent à nos cellules de présences
+  coorXY[which(!is.na(env_amphib_df[, "amphib"])), ],
+  # Ensuite, on récupère la colonne qui indique présence pour chaque cellule
+  occurrence = env_amphib_df[which(!is.na(env_amphib_df[, "amphib"])),
+                             "amphib"])
+
+P_points
+```
+
+
+# Génération des points de background
+
+La littérature statistique récente suggère que les meilleures pratiques 
+consistent à générer un grand nombre de points de background (e.g., 10000)
+indépendamment de la localisation des points de présence (i.e., un point de 
+background peut être localisé au même endroit qu'un point de présence). Cela
+permet d'assurer une bonne représentation de l'ensemble des conditions 
+environnementales disponibles dans le modèle. Dans le cas de la Corse, le 
+nombre de points de background sera limité par le nombre de pixels disponibles :
+
+```{r}
+# Nous avons éliminé les données manquantes du tableau env_amphib_df
+# Par conséquent, son nombre de lignes est égal au nombre total de pixels 
+# disponibles sur la Corse
+nrow(env_amphib_df)
+```
+
+Ainsi, nous fixerons le nombre de background par défaut à 10000 ce qui sera suffisant pour
+une bonne calibration des modèles.
+Il n'est pas nécessaire de faire plusieurs répétitions, car le nombre de 
+points de background est déjà suffisamment élevé, les résultats de calibration
+ne varieraient pas entre différentes répétitions.
+
+Des tests préliminaires ont montré que la distance aux routes joue très 
+fortement sur les résultats des modèles. Voici une illustration de la 
+distribution des occurrences par rapport à la distance aux routes :
+
+```{r}
+# Illustration de l'effet de la distance aux routes
+dist_routes <- extract(env_corse[["distance_routes"]],
+                       P_points[, c("x", "y")])
+ggplot(dist_routes, aes(x = distance_routes)) +
+  geom_density()
+
+```
+
+La méthode la plus efficace pour gérer le biais d'échantillonnage dans les 
+modèles consiste à intégrer directement le 
+biais dans la génération des backgrounds ; ce qui est plus efficace que de 
+l'inclure en variable explicative.
+
+```{r, fig.height = 7, fig.width = 5}
+prob_distance_routes <- env_corse[["distance_routes"]]
+# Utilisation d'une exponentielle inverse pour la probabilité d'échantillonnage
+
+prob_distance_routes <- 
+  exp(-(prob_distance_routes / global(prob_distance_routes,
+                                      "max", na.rm = T)[1, 1] + 1)^2)
+
+# On réduit également le nombre de background pour avoir un effet du biais
+background <- spatSample(prob_distance_routes,
+                         method = "weights",
+                         size = 5000,
+                         replace = FALSE, # Pas de remise 
+                         na.rm = TRUE, # Pas dans les données manquantes
+                         xy = TRUE, # L'output inclut les coords XY
+                         values = FALSE) # L'output exclut les variables
+
+# On ajoute les points de background aux données de présence
+P_points <- rbind.data.frame(P_points,
+                             data.frame(background, 
+                                        occurrence = 0))
+
+```
+# Sélection des variables environnementales
+
+
+##  Climat
+
+La température –  proxy de la disponibilité de l'énergie - régule et contraint les processus physiologiques fondamentaux des ectothermes, tels que l'action musculaire (e.g., l'activité locomotrice), les taux métaboliques, les taux de croissance, la différenciation, la gamétogenèse et les cycles de reproduction (Taylor et al., 2021). L'humidité de l'environnement - proxy de la disponibilité de l'eau - dicte le risque de mort par dessiccation d'un amphibien, et donc les schémas saisonniers et quotidiens des processus d'histoire de vie, tels que la dispersion et la reproduction (Taylor et al., 2021). 
+
+La littérature sur les trois amphibiens suggère qu'il existe des limites altitudinales minimales et maximales à leurs distributions. Ces limites reflètent probablement des conditions de température et d'humidité propres aux différents étages altitudinaux : une limite inférieure due aux périodes trop chaudes et trop arides, et une limite supérieure due aux périodes trop froides. Par conséquent nous utiliserons des variables reflétant les limites supérieurs et inférieures et avec une hétérogénéité limitée dans la saisonalité :
+
+ - températures les plus chaudes (*bio5*) et les plus froides de l'année (*bio6*)
+ 
+ - saisonalité des précipitations (*bio15*) 
+ 
+ - humidité relative minimale (*cmi_min*) et maximale (*cmi_max*).
+
+
+
+
+##  Occupation du sol
+
+Bien que les trois espèces cibles occupent des habitats divers, toutes sont inféodées aux milieux humides pour au moins un stade de développement. Il est ainsi attendu une relation forte et positive avec les milieux humides, de manière non-linéaire (il faut un minimum de milieux humides dans la maille pour assurer la présence des espèces). Les espèces du groupe pourraient préférer les milieux lentiques plutôt que lotiques (Trochet et al. 2020), mais cette préférence n'est pas bien établie, donc nous ne ferons pas cette distinction.  
+
+Les trois espèces sont également inféodées aux milieux forestiers, voire particulièrement aux ruisseaux de milieux forestiers (Goux 1955 ; Bosc et Destandau 2012 ; Bosc 2001 ; Bensetti et Gaudillat 2002, Trochet et al. 2020). Ainsi, il est attendu un effet positif des habitats forestiers sur la probablité d'observation de l'espèce. L'interaction ruisseau - forêts pourrait s'avérer être un facteur encore plus pertinent pour la probabilité d'observer ce groupe.
+
+Noms des variables retenues :
+
+ - présence des milieux humides (*milieux_eaudouce*)
+ 
+ - milieux forestiers (*forets*)
+
+##  Biais d'échantillonnage
+
+La probabilité d'observer les espèces est souvent directement liée à l'accessibilité du milieu, qui est connue pour être fortement corrélée à la distance aux routes. Nous utiliserons donc la distance aux routes comme proxy du biais d'échantillonnage afin d'éviter que les modèles ne cherchent à expliquer l'accessibilité par les autres variables environnementales.
+
+
+Noms des variables retenues :
+
+ - distance aux routes (*distance_routes*)
+
+
+
+##  Variables anthropogéniques
+
+Ces espèces ont été supposées vulnérables aux perturbartions anthropiques ; par conséquent il faudra explorer s'il existe un effet de variables associées aux perturbations : densité de population humaine, distance aux zones urbaines, milieux agricoles. Néanmoins, un tel effet ne doit pas être étudié si beaucoup de données d'occurrence anciennes (avant 2000) sont incluses, pour éviter une erreur d'attribution espèce - perturbation. Sachant que nous n'avons conservé que les données d'occurrence postérieures à 2000, nous pouvons tester cette hypothèse. Etant donné que plusieurs perturbations peuvent agir conjointement sur les amphibiens, utiliser une variable intégrant plusieurs perturbations potentielles comme la naturalité paraît être la démarche la plus appropriée, en supposant un effet positif de la  naturalité sur la présence des amphibiens. 
+
+Nom des variables retenues :
+
+ - naturalité (*naturalite*)
+
+
+
+
+##  Autres variables et commentaires
+
+L'altitude est fréquemment suggérée comme facteur expliquant la distribution des amphibiens. Cependant, cette variable n'a pas d'effet directe sur leur biologie, c'est ce qu'on appelle une 'variable distale'. Elle est plutôt corrélée à d'autres variables, qui elles jouent directement sur la biologie des amphibiens (appelées variables proximales). Ainsi, l'altitude ne sera pas pré-sélectionnée comme facteur explicatif pour les modèles d'habitat des amphibiens.
+
+## Constitution du jeu de variables finales pour les amphibiens
+
+### Préparation des rasters
+
+```{r}
+env_amphib <- env_corse[[c("bio5",
+                           "bio6",
+                           "bio15",
+                           "cmi_min",
+                           "cmi_max",
+                           "milieux_eaudouce",
+                           "forets",
+                           "naturalite")]]
+```
+
+
+### Etude de la colinéarité
+
+On étudie la colinéarité entre les variables avec le coefficient de corrélation
+de Spearman (car certaines variables, précipitations notamment, ne sont pas du
+tout distribuées normalement), en utilisant un seuil standard de 0.7. 
+
+```{r fig.height = 10, fig.width = 10}
+var_groups <- removeCollinearity(env_amphib,
+                                 plot = TRUE,
+                                 multicollinearity.cutoff = 0.7,
+                                 method = "spearman")
+```
+
+Il n'y a pas d'effet de colinéarité importante chez les amphibiens. Les 
+variables de distance aux routes et de naturalité semblent corrélées, 
+mais pas suffisamment pour justifier d'éliminer l'une des deux. Une telle 
+corrélation serait plus problématique en cas de projection hors de l'espace de
+calibration (i.e., projections futures ou projections dans d'autres zones 
+géographiques), ce qui ne sera pas le cas ici. 
+
+
+# Préparation de la stratégie de validation croisée des modèles
+
+Nous allons utiliser une procédure de validation croisée par bloc ce qui permet
+de réduire l'autocorrélation spatiale entre jeu de données de calibration et 
+jeu de validation. 
+
+## Définition de la taille des blocs
+
+Il faut étudier le degré d'autocorrélation spatiale dans les variables 
+environnementales pour avoir une idée de la taille des blocs. La taille des 
+blocs est un compromis entre la diminution de l'autocorrélation spatiale et les
+contraintes des données.
+
+```{r warning = FALSE}
+# Pour étudier la taille des blocs à viser, il faut d'abord projeter le raster
+env_amphib_l93 <- project(env_amphib,
+                          "EPSG:2154")
+
+# Ensuite on étudie le range d'autocorrélation spatiale
+AC_range <- cv_spatial_autocor(env_amphib_l93)
+```
+
+On obtient un range médian qui est de `r AC_range$range`, ce qui est 
+satisfaisant ici pour réaliser une validation croisée par blocs : il y a 
+beaucoup de blocs, ce qui signifie que la répartition des blocs en plis sera 
+probablement bien équilibrée.
+
+```{r warning=FALSE,}
+P_points_sf <- st_as_sf(P_points, 
+                        coords = c("x", "y"), 
+                        crs = "EPSG:4326")
+
+plis_cv <- cv_spatial(x = P_points_sf,
+                      column = "occurrence", # Nom de la colonne des occurrences
+                      k = 5, # Nombre de plis (folds) pour la k-fold CV
+                      size = AC_range$range, # Taille des blocs en metres
+                      selection = "random", # Attribution des blocs aléatoire dans 
+                      # les plis
+                      iteration = 50, # Nombre d'essais pour trouver des plis
+                      # équilibrés
+                      biomod2 = TRUE, # Formater les données pour biomod2
+                      r = env_amphib, # Pour le fond de carte
+                      progress = FALSE) 
+
+```
+
+On voit que nos plis sont plutôt bien équilibrés, avec environ 400 présences en
+moyenne pour la calibration, et de l'ordre de 70 à 130 présences pour
+l'évaluation, ce qui est correct.
+
+
+Dernière étape, biomod2 exige un format particulier pour les plis de validation
+croisée, donc on va préparer ce format ici :
+
+```{r}
+table_cv <- plis_cv$biomod_table
+colnames(table_cv) <- paste0("_allData_", 
+                             colnames(table_cv))
+```
+
+
+# Calibration des modèles
+
+Tout d'abord on prépare les données pour biomod2.
+
+```{r}
+coorxy <- P_points[, c("x", "y")]
+occurrences <- P_points[, "occurrence"]
+
+
+dir.create("models/amphibiens", recursive = T, showWarnings = FALSE)
+
+run_data <- BIOMOD_FormatingData(
+  resp.name = "amphibiens", # Nom de l'espèce
+  resp.var = occurrences, # Présences + background
+  expl.var = env_amphib, # Variables environnementales prédictives
+  dir.name = "models", # Dossier dans lequel on va stocker les modèles
+  resp.xy = coorxy, # Coordonnées xy des présences et background
+  PA.strategy = NULL) # Pas de génération de points de background par biomod
+# Car on en a généré nous-mêmes
+
+saveRDS(run_data, file = paste0("models/amphibiens/run_data.RDS"))
+```
+Biomod nous indique deux choses : que nous n'avons pas de données indépendantes
+pour l'évaluation, ce qui est effectivement le cas à ce stade de l'étude.
+Par ailleurs, que plusieurs données peuvent être dans la même cellule, ce qui 
+est également attendu car nous avons tiré aléatoirement nos background dans
+toute la zone d'étude et donc ils ont pu tomber dans les mêmes cellules que des 
+points de présence. Pas d'inquiétudes, c'est ce que l'on avait prévu.
+
+On va pouvoir désormais préparer la calibration des modèles, en les paramétrant
+de manière correcte. Ce qui est important de savoir ici c'est que nos modèles
+vont avoir deux grosses difficultés statistiques :
+
+ - *déséquilibre des classes* : il y a au total
+ `r length(which(occurrences == 1))` présences et 10000 backgrounds (qui seront
+ considérés comme des valeurs de 0 par les modèles), ce qui crée un gros 
+ déséquilibre entre les 1 et les 0. C'est ce qu'on appelle le déséquilibre des
+ classes
+ 
+ - *chevauchement des classes* : il est probable que les présences et les
+ backgrounds se chevauchent sur les gradients de variables environnementales
+ (d'autant plus que nous pouvons avoir parfois une présence et un background
+ dans le même pixel), ce qui rend la distinction entre les 1 et les 0 difficile
+ pour les modèles. C'est ce qu'on appelle le chevauchement des classes
+ 
+La solution pour bien paramétrer les modèles face au déséquilibre et au
+chevauchement varie selon les modèles, mais le principe général est de réduire
+l'importance des backgrounds lors de la calibration par rapport au présence,
+afin de viser un ratio équilibre 50/50 entre importance des présences et 
+importance des backgrounds. Par exemple, on va attribuer des poids
+aux présences et aux backgrounds de sorte que la somme du poids des présences
+et des backgrounds soit égale. Cependant, cette méthode fonctionne mal sur 
+certains modèles comme le random forest, et il faut alors le paramétrer de 
+manière plus fine avec un rééchantillonnage à 50/50 en interne. 
+
+Par ailleurs, il est important de noter que l'évaluation des modèles avec la
+validation croisée n'est pas un élément validant la robustesse du modèle. Elle
+est plutôt à considérer comme un élément qui élimine les mauvais modèles, mais
+elle ne constitue pas une preuve de robustesse quand elle est bonne, car elle
+est limitée à la fois par la nature des données (présence-seule, pas 
+d'absences), et par la possibilité qu'il y ait des biais dans 
+l'échantillonnage. Ainsi, il est difficile d'utiliser la validation croisée
+pour identifier les meilleurs modèles ; il vaut mieux donc se baser sur des 
+paramètres établis pour être robustes en situation de présence-seule (e.g.,
+Valavi et al. 2021).
+ 
+Préparons donc la calibration de nos modèles :
+
+
+ 
+```{r warning=FALSE}
+calib_summary <- 
+  summary(run_data, calib.lines =  table_cv) %>% 
+  filter(dataset == "calibration")
+
+iwp <- (10^6)^(1 - occurrences)
+
+
+RF_param_list <- NULL
+GLM_param_list <- NULL
+GBM_param_list <- NULL
+XGBOOST_param_list <- NULL
+XGBOOST_param_list <- NULL
+GAM_param_list <- NULL
+MARS_param_list <- NULL
+XGBOOST_param_list <- NULL
+for (cvrun in 1:nrow(calib_summary)) {
+  
+  prNum <- calib_summary$Presences[cvrun]
+  bgNum <- calib_summary$True_Absences[cvrun]
+
+  wt <- ifelse(occurrences == 1, 1, prNum / bgNum)
+
+  RF_param_list[[paste0("_",
+                        calib_summary$PA[[cvrun]],
+                        "_",
+                        calib_summary$run[[cvrun]])]] =
+    list(ntree = 1000,
+         sampsize =  c("0" = prNum,
+                       "1" = prNum),
+         replace = TRUE)
+  
+  GLM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] =
+    list(weights = wt)
+  
+  
+  GBM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] =
+    list(interaction.depth = 5,
+         n.trees = 500, 
+         shrinkage = 0.001,
+         bag.fraction = 0.75,
+         cv.folds = 5,
+         weights = wt)
+  
+  GAM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-     
+    list(weights = wt,
+         method = "REML")
+  
+  MARS_param_list[[paste0("_",
+                          calib_summary$PA[[cvrun]],
+                          "_",
+                          calib_summary$run[[cvrun]])]] <- 
+    list(weights = wt)
+  
+  XGBOOST_param_list[[paste0("_",
+                             calib_summary$PA[[cvrun]],
+                             "_",
+                             calib_summary$run[[cvrun]])]] <-
+    list(nrounds = 10000,
+         eta = 0.001,
+         max_depth = 5,
+         subsample = 0.75,
+         gamma = 0,
+         colsample_bytree = 0.8,
+         min_child_weight = 1,
+         weight = wt,
+         verbose = 0)
+}
+
+model_parameters <- bm_ModelingOptions(
+  data.type = "binary",
+  models = c("GLM", "GBM", "GAM.mgcv.gam", "MARS", "RF", "MAXNET", "XGBOOST"),
+  strategy = "user.defined",
+  user.base = "default",
+  user.val = list(
+    GLM.binary.stats.glm = GLM_param_list,
+    GBM.binary.gbm.gbm = GBM_param_list,
+    GAM.binary.mgcv.gam = GAM_param_list,
+    MARS.binary.earth.earth = MARS_param_list,
+    RF.binary.randomForest.randomForest = RF_param_list,
+    XGBOOST.binary.xgboost.xgboost = XGBOOST_param_list
+  ),
+  bm.format = run_data,
+  calib.lines = table_cv
+)
+
+
+
+```
+
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+model_runs <- BIOMOD_Modeling(
+  run_data,
+  modeling.id = "1", # ID de modélisation, on met 1 pour tous nos modèles ici
+  models = c("GLM", "GBM", "GAM", "MARS", 
+             "RF",  "MAXNET", "XGBOOST"),
+  OPT.strategy = "user.defined",
+  OPT.user = model_parameters, # Paramètres des modèles
+  CV.strategy = "user.defined", # Méthode de validation croisée
+  CV.user.table = table_cv, # Plis générés précéemment
+  CV.do.full.models = FALSE,
+  var.import = 10, # Nombre de répétitions d'importance des variables
+  metric.eval = "BOYCE",
+  do.progress = FALSE,
+  nb.cpu = 16 # Nombre de coeurs à utiliser pour la modélisation
+  # A ajuster selon votre ordinateur, ne pas en mettre trop !
+)
+saveRDS(model_runs, file = "models/amphibiens/model_runs.RDS")
+```
+
+
+# Evaluation des modèles
+
+```{r}
+evals_boyce <- get_evaluations(model_runs)
+ggplot(evals_boyce, aes(x = algo, y = validation)) +
+  geom_point(aes(col = run))
+```
+
+# Importance des variables
+
+```{r}
+varimp <- get_variables_importance(model_runs)
+
+varimp$expl.var <- reorder(varimp$expl.var,
+                           varimp$var.imp,
+                           median,
+                           na.rm = TRUE)
+
+
+varimp %>%
+  group_by(expl.var) %>%
+  summarise(median = median(var.imp))
+
+ggplot(varimp) + 
+  geom_boxplot(aes(x = expl.var, y = var.imp)) +
+  geom_jitter(aes(x = expl.var, y = var.imp, col = algo),
+              alpha = .3) +
+  coord_flip() +
+  theme_minimal()
+
+```
+
+
+# Courbes de réponse
+
+```{r, fig.height = 6, fig.width = 6, warning = FALSE}
+# Variables utilisées pour la calibration
+cur_vars <- model_runs@expl.var.names
+
+# Calcul des courbes de réponse
+resp <- bm_PlotResponseCurves(bm.out = model_runs,
+                              fixed.var = "mean",
+                              data_species = occurrences,
+                              do.plot = FALSE,
+                              do.progress = FALSE)$tab
+
+colnames(resp) <- c("Index", "Variable", "Var.value", "Model", "Response")
+
+for (model in c("GLM", "GBM", "GAM", "MARS", #
+                "RF", "MAXNET", "XGBOOST")) {
+  p <- ggplot(resp[grep(model, resp$Model), ], aes(x = Var.value, y = Response)) + 
+  geom_line(alpha = 0.2, aes(group = Model)) + 
+  stat_smooth() +
+  facet_wrap(~ Variable, scales = "free_x") + 
+  theme_bw() + 
+  ylim(0, 1.1) + 
+  xlab("Variable value") +
+    ggtitle(model)
+  
+  print(p)
+}
+
+
+```
+
+# Cartes
+
+```{r, fig.width = 6, fig.height = 3, message=FALSE, warning=FALSE, results='hide'}
+# On ne va garder que les modèles qui ont un indice de Boyce suffisamment élevé
+models_to_proj <- evals_boyce$full.name[which(evals_boyce$validation >= 0.8)]
+
+
+projection_runs <- BIOMOD_Projection(
+  bm.mod = model_runs, # Modèles calibrés
+  proj.name = "corse", # Nom de la projection actuelle
+  new.env = env_amphib, # Données environnementales sur lesquelles on projette les modèles
+  models.chosen = models_to_proj, # Modèles à projeter
+  build.clamping.mask = TRUE, # Le clamping mask illustre les zones où les prédictions sont en dehors des valeurs
+  # utilisées lors de la calibration
+  nb.cpu = 4)
+
+cartes_individuelles <- rast("models/amphibiens/proj_corse/proj_corse_amphibiens.tif")
+
+
+# Rescaling des projections qui dépassent l'intervalle 0 - 1000
+cartes_individuelles[cartes_individuelles < 0] <- 0
+cartes_individuelles[cartes_individuelles > 1000] <- 1000
+
+for(i in 1:ceiling(nlyr(cartes_individuelles) / 2)) {
+  plot(cartes_individuelles[[(i * 2 - 1):
+                               min(nlyr(cartes_individuelles),
+                                   (i * 2))]], 
+       col = viridis::inferno(12))
+}
+
+
+```
+
+# Carte finale
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_finale <- mean(cartes_individuelles)
+plot(carte_finale, 
+     col = viridis::inferno(12))
+points(y ~ x, data = P_points[which(P_points$occurrence == 1), ],
+       pch = 16, cex = .4, 
+       col = "#21908CFF")
+```
+
+
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_incertitude <- app(cartes_individuelles, sd)
+ggplot() +
+  geom_spatraster(data = carte_incertitude) +
+  scale_fill_continuous(type = "viridis") +
+  ggtitle("Incertitude\n(écart-type des probabilités)")
+```
+
+
+## Carte de rendu, essai 1
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+favorabilite_presences <- extract(carte_finale,
+                                  P_points[which(P_points$occurrence == 1),
+                                           c("x", "y")],
+                                  ID = FALSE)
+qt_favorabilite <- quantile(favorabilite_presences$mean, probs = c(.10, .25))
+
+carte_indice <- carte_finale
+carte_indice[carte_finale < qt_favorabilite["10%"]] <- 0
+carte_indice[carte_finale >= qt_favorabilite["10%"] &
+               carte_finale < qt_favorabilite["25%"]] <- 1
+carte_indice[carte_finale >= qt_favorabilite["25%"]] <- 2
+
+carte_indice <- as.factor(carte_indice)
+
+# Version sans incertitude
+
+ggplot() + 
+  geom_spatraster(data = carte_indice) +
+  scale_fill_manual(values = viridis::plasma(3),
+                    name = paste0("Favorabilité\n(% du total d'occurrences\n",
+                                  "observé dans cette classe\n",
+                                  "de favorabilité)"),
+                    labels = c("Faible ou méconnue (< 10%)",
+                               "Intermédiaire (10-25%)",
+                               "Elevée (75%)"),
+                    na.translate = F) 
+
+# Version avec incertitude super-imposée en nuances de gris transparent
+df_incertitude <- as.data.frame(carte_incertitude / 1000,
+                                xy = TRUE)
+df_incertitude$sd_minmax <- df_incertitude$sd - min(df_incertitude$sd)
+
+ggplot() + 
+  geom_spatraster(data = carte_indice) +
+  geom_tile(data = df_incertitude,
+            aes(x = x, y = y, alpha = sd_minmax)) +
+  scale_fill_manual(values = viridis::plasma(3),
+                    name = paste0("Favorabilité\n(% du total d'occurrences\n",
+                                  "observé dans cette classe\n",
+                                  "de favorabilité)"),
+                    labels = c("Faible ou méconnue (< 10%)",
+                               "Intermédiaire (10-25%)",
+                               "Elevée (75%)"),
+                    na.translate = F) +
+  scale_alpha_continuous(name = "Incertitude",
+                         range = c(0, .75),
+                         breaks = c(0, .1, .2),
+                         labels = c("Très faible", "Faible", "Modérée"))
+
+```
+
+
+## Carte de rendu, essai 2
+
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+# Exploration d'un indice de densité de présences par classe de favorabilité
+fav <- values(carte_finale, data.frame = TRUE, na.rm = TRUE)
+species_fav <- extract(carte_finale,
+                       P_points[which(P_points$occurrence == 1),
+                                c("x", "y")],
+                       ID = FALSE)
+
+step = 1
+range = 50
+res <- NULL
+for (cur.int in seq(0, 950, by = step)) {
+
+  cur.int <- c(cur.int, cur.int + range)
+  
+  nb_cells <- length(which(fav[, 1] > cur.int[1] & fav[, 1] <= cur.int[2]))
+  
+  nb_occupied_cells <- length(which(species_fav[, 1] > cur.int[1] & 
+                                      species_fav[, 1] <= cur.int[2]))
+  res <- rbind(res,
+               data.frame(low = cur.int[1],
+                          high = cur.int[2],
+                          nb_occupied_cells = nb_occupied_cells,
+                          nb_cells = nb_cells,
+                          ratio = nb_occupied_cells / nb_cells))
+
+}
+
+res$ratio_presences <- res$nb_occupied_cells / sum(res$nb_occupied_cells)
+
+intermed_cutoff <- res[min(which(res$ratio > 0.05)), ] 
+high_cutoff <- res[min(which(res$ratio > 0.2)), ] 
+
+plot(res$ratio ~ res$high)
+abline(v = intermed_cutoff$low)
+abline(v = high_cutoff$low)
+plot(res$ratio_presences ~ res$high)
+abline(v = intermed_cutoff$low)
+abline(v = high_cutoff$low)
+
+carte_indice <- carte_finale
+carte_indice[carte_finale < intermed_cutoff$low] <- 0
+carte_indice[carte_finale >= intermed_cutoff$low &
+               carte_finale < high_cutoff$low] <- 1
+carte_indice[carte_finale >= high_cutoff$low] <- 2
+
+carte_indice <- as.factor(carte_indice)
+
+ggplot() + 
+  geom_spatraster(data = carte_indice) +
+  scale_fill_manual(values = viridis::plasma(3),
+                    name = "Favorabilité\n(% de cellules occupées)",
+                    labels = c("Faible ou méconnue (<5%)",
+                               "Intermédiaire (5-25%)",
+                               "Elevée (>25%)"),
+                    na.translate = F)
+
+```

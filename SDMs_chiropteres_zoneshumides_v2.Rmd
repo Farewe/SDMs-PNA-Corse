@@ -1,0 +1,1130 @@
+---
+title: "Chiroptères zones humides"
+author: "Boris Leroy"
+date: "`r format(Sys.time(), '%d/%m/%y')`"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    toc: yes
+    df_print: paged
+---
+### *Note sur ce gabarit Rmarkdown*
+
+Copyright Boris Leroy, `r format(Sys.time(), '%y')`
+
+leroy.boris@gmail.com
+
+Ce fichier constitue un gabarit complet pour la modélisation des habitats 
+potentiels d'une espèce ou d'un groupe d'espèce. [**Il est fourni sous licence 
+libre CeCILL-C**.](https://cecill.info/licences.fr.html)
+
+
+Ce fichier est régi par la licence CeCILL-C soumise au droit français et
+respectant les principes de diffusion des logiciels libres. Vous pouvez
+utiliser, modifier et/ou redistribuer ce programme sous les conditions
+de la licence CeCILL-C telle que diffusée par le CEA, le CNRS et l'INRIA 
+sur le site "http://www.cecill.info".
+
+En contrepartie de l'accessibilité au code source et des droits de copie,
+de modification et de redistribution accordés par cette licence, il n'est
+offert aux utilisateurs qu'une garantie limitée.  Pour les mêmes raisons,
+seule une responsabilité restreinte pèse sur l'auteur du programme,  le
+titulaire des droits patrimoniaux et les concédants successifs.
+
+*La licence CeCILL-C implique une obligation de citation et de diffusion du code
+sous licence libre en cas de réutilisation.*
+
+Citation recommandée :
+**Leroy B**. 2024. Modélisation de l'habitat des groupes d'espèces sujettes aux
+plans nationaux d'action. Code source disponible sur https://www.borisleroy.com/sdms-pna-corse
+
+
+
+Le code a été testé fonctionnel sur la version de R `r R.version.string`, avec les packages
+sf (`r packageVersion("sf")`), terra (`r packageVersion("terra")`), ggplot2 
+(`r packageVersion("ggplot2")`), scales (`r packageVersion("scales")`), egg 
+(`r packageVersion("egg")`), virtualspecies 
+(`r packageVersion("virtualspecies")`), blockCV 
+(`r packageVersion("blockCV")`), biomod2 (`r packageVersion("biomod2")`),
+dplyr (`r packageVersion("dplyr")`), 
+tidyterra (`r packageVersion("tidyterra")`), viridis 
+(`r packageVersion("viridis")`). 
+
+Il est possible que des évolutions futures de packages (notamment, biomod2, qui 
+est sujet à de nombreuses évolutions en 2023 et 2024) rendent certaines parties
+du fichier non fonctionnelles, ce qui nécessitera de corriger le code.
+
+
+
+# Pré-requis :
+
+Chargement des packages et fonctions, chargement de données géographiques et
+des variables environnementales harmonisées
+
+```{r message=FALSE, warning=FALSE}
+library(sf)
+library(terra)
+library(ggplot2)
+library(scales)
+library(egg)
+library(virtualspecies)
+library(blockCV)
+library(biomod2)
+library(dplyr)
+library(tidyterra)
+library(viridis)
+source("scripts/functions.R")
+
+# Shapefile de la Corse
+corse <- st_read("data/corse.gpkg")
+# Données environnementales harmonisées
+env_corse <- rast("data/env_corse_total_sync.tif")
+```
+
+# Chargement et préparation des données d'occurrence
+
+```{r fig.height=3, fig.width=6, message=FALSE, warning=FALSE}
+chirozh <- st_read("data/donnees_brutes/taxa/Chiro_ZH.shp")
+# Simplification du nom d'espèce en binomial
+chirozh$species <- simplify_species_name(chirozh$nom_valide)
+
+# Dates d'échantillonnage
+chirozh$year <- as.numeric(strtrim(chirozh$date_fin, 4))
+chirozh$month <- as.numeric(substr(chirozh$date_fin, 6, 7))
+
+# Visualisation de la temporalité des occurrences
+ggplot(chirozh) +
+  geom_boxplot(aes(x = species,
+                   y = year))+ 
+  coord_flip() +
+  scale_y_continuous(breaks = breaks_pretty()) +
+  theme_minimal()
+```
+
+## Filtre temporel
+
+Les espèces présentent une saisonnalité forte ; nous ne modéliserons ici que les habitats de la période estivale pour laquelle il existe suffisamment de données.
+Le Groupe Chiroptères Corses suggère une temporalité allant du 15 mai au 15 septembre ; nous ne retiendrons donc que les données des mois de mai à septembre.
+
+```{r fig.height=10, fig.width=6}
+chirozh <- chirozh[chirozh$month >= 5 & 
+                             chirozh$month <= 9, ]
+```
+
+Il faut établir un filtre temporel pour éliminer les données imprécises, 
+sachant que l'objectif est de modéliser à une résolution assez fine, de l'ordre
+de 1km.
+Le champ `precision` est peu renseigné et donc peu utile ici, il nous faut donc
+poser une hypothèse sur les données qui sont imprécises. On peut considérer que
+les GPS ont commencé à être largement disponibles à partir de 1990, mais leur
+utilisation ne s'est généralisée qu'à partir des années 2000, notamment grâce
+à leur miniaturisation. Ainsi, on peut spéculer qu'avant les années 2000, les
+données étaient moins précisés car possiblement géolocalisées en utilisant des
+référentiels comme les lieu-dits ou les communes, tandis qu'à partir des années
+2000 la précision s'est améliorée grâce à la géolocalisation par satellite.
+
+Le nombre de données supprimées en fixant un seuil à l'année 2000 est 
+extrêmement faible :
+
+```{r fig.height=10, fig.width=6}
+# Les données avant 2000 représentent un % modéré du jeu de données : 
+100 * length(which(chirozh$year < 2000)) / nrow(chirozh)
+```
+
+La couverture temporelle sur l'année est variable selon les années :
+
+```{r fig.height=10, fig.width=10}
+ggplot(chirozh) +
+  geom_boxplot(aes(x = species,
+                   y = month)) +
+  facet_wrap(~year) + 
+  coord_flip() +
+  scale_y_continuous(breaks = breaks_pretty()) +
+  theme_minimal()
+```
+
+L'emprise spatiale des données d'occurrence ne change pas de manière majeure 
+avec ou sans les données pré-2000 :
+
+```{r fig.height=7, fig.width=10}
+
+p_chirozh_all <- ggplot() +
+  geom_sf(data = corse) +
+  geom_sf(data = chirozh, aes(col = year)) +
+  scale_color_continuous(type = "viridis") + 
+  theme_minimal(base_size = 15) +
+  ggtitle("Toutes données\nchiroptères zones humides")
+
+p_chirozh_post2000 <- ggplot() +
+  geom_sf(data = corse) +
+  geom_sf(data = chirozh[chirozh$year >= 2000, ], aes(col = year)) +
+  scale_color_continuous(type = "viridis") + 
+  theme_minimal(base_size = 15) +
+  ggtitle("Données post-2000\nchiroptères zones humides")
+
+ggarrange(p_chirozh_all,
+          p_chirozh_post2000,
+          nrow = 1)
+```
+
+On pose donc l'hypothèse raisonnable qu'un filtre à 2000 va assurer une bonne 
+précision dans la localisation des occurrences sans perdre d'information
+critique sur la répartition des espèces.
+
+```{r}
+chirozh <- chirozh[which(chirozh$year >= 2000), ]
+```
+
+## Rasterisation des occurrences
+
+L'objectif ici est de ne garder qu'une occurrence par cellule à la résolution 
+de nos variables environnementales afin d'éviter une forme extrême de
+pseudo-réplication.  Par exemple, si dans une cellule donnée on a initialement
+30 observations de la même espèce, alors, après rasterisation, ces 30 
+observations ne compteront que comme une seule occurrence. Cette étape est
+indispensable car elle évite de donner aux modèles, par exemple, 30 fois la même
+valeur de température provenant d'une seule cellule. C'est ce qu'on appelle
+de la pseudo-réplication et c'est très problématique pour les domaines. 
+On s'attend donc à ce que cette étape réduise le nombre d'occurrences pour les
+modèles.
+
+```{r}
+# On rasterise les occurrences à la résolution de nos variables 
+# environnementales
+chirozh_r <- rasterize(chirozh, 
+                      env_corse)
+names(chirozh_r) <- "chirozh"
+
+plot(chirozh_r)
+```
+
+
+On va ensuite éliminer les occurrence qui sont dans des zones sans 
+valeurs de variables environnementales  (i.e., essentiellement en zones 
+côtières). Pour cela on va combiner les variables
+environnementales avec les occurrences rasterisées dans un `data.frame`, et 
+supprimer les occurrences d'espèces qui tombent sur des données 
+environnementales manquantes
+
+```{r}
+# On crée un stack avec nos occurrences rasterisées et les variables env
+env_chirozh <- c(env_corse,
+                 chirozh_r)
+
+# On récupère les coordonnées XY de toutes les cellules, pour préparer nos
+# données finales
+coorXY <- xyFromCell(env_corse, 
+                     1:ncell(env_corse))
+# On transforme le raster en data.frame 
+env_chirozh_df <- values(env_chirozh)
+
+# On regarde le nombre d'occurrences pour lesquelles il y a des données 
+# manquantes : 
+length(which(is.na(env_chirozh_df[, "bio1"]) & 
+               !is.na(env_chirozh_df[, "chirozh"])))
+```
+
+On va maintenant supprimer les cellules pour lesquelles on n'a pas de données
+environnementales. Pour cela on va utiliser la première variable
+environnementale ici, car les données manquantes sont toutes les mêmes
+entre toutes les variables environnementales (cf. script harmonisation des
+données).
+
+
+```{r}
+# On filtre d'abord sur l'objet qui contient les coordonnées
+coorXY <- coorXY[-which(is.na(env_chirozh_df[, 1])), ]
+# Et ensuite sur le tableau avec variables env et présences d'espèces
+env_chirozh_df <- env_chirozh_df[which(!is.na(env_chirozh_df[, 1])), ]
+
+# Comparaison du nombre d'occurrences :
+# Avant rasterisation
+nrow(chirozh)
+
+# Après rasterisation et élimination des données env manquantes
+length(which(env_chirozh_df[, "chirozh"] == 1))
+```
+
+Il s'agit donc du nombre d'occurrences que l'on va pouvoir utiliser pour 
+calibrer nos modèles. Il n'y a que 
+`r length(which(env_chirozh_df[, "chirozh"] == 1))``
+occurrences donc on va limiter le nombre de variables utilisées pour les 
+modèles.
+
+On va maintenant formater ces occurrences en combinant
+coordonnées et info sur l'occurrence dans un `data.frame` pour préparer la
+calibration de nos modèles
+
+```{r}
+P_points <- data.frame(
+  # D'abord on récupère les coordonnées XY qui correspondent à nos cellules de présences
+  coorXY[which(!is.na(env_chirozh_df[, "chirozh"])), ],
+  # Ensuite, on récupère la colonne qui indique présence pour chaque cellule
+  occurrence = env_chirozh_df[which(!is.na(env_chirozh_df[, "chirozh"])),
+                             "chirozh"])
+
+P_points
+```
+
+
+# Génération des points de background
+
+Etant donné que nos observations sont des présences-seules, i.e. sans données
+d'absences, il nous faut générer des points de "background" pour pouvoir 
+calibrer les modèles. Ces points de backgrounds sont des données tirées dans
+toute la zone d'étude qui renseignent les modèles sur comment les variables
+environnementales sont distribuées dans la géographie. Ces points seront fournis
+aux modèles comme des 0, ce qui permettra aux modèles d'identifier quels 
+habitats apparaissent comme favorable parmi l'ensemble des habitats disponibles.
+Cependant, ces 0 ne sont pas interprétés comme des absences, et l'interprétation
+finale du modèle nécessitera des précautions particulières, comme par exemple
+ne pas considérer la valeur issue du modèle comme une "probabilité de présence" 
+; elle sera plutôt considérée comme un indice de favorabilité de l'habitat.
+
+La littérature statistique récente suggère que les meilleures pratiques 
+consistent à générer un grand nombre de points de background (e.g., 10000)
+indépendamment de la localisation des points de présence (i.e., un point de 
+background peut être localisé au même endroit qu'un point de présence). Cela
+permet d'assurer une bonne représentation de l'ensemble des conditions 
+environnementales disponibles dans le modèle. Dans le cas de la Corse, le 
+nombre de points de background sera limité par le nombre de pixels disponibles :
+
+```{r}
+# Nous avons éliminé les données manquantes du tableau env_amphib_df
+# Par conséquent, son nombre de lignes est égal au nombre total de pixels 
+# disponibles sur la Corse
+nrow(env_chirozh_df)
+```
+
+
+Ainsi, nous partons sur un point de départ à 10000 backgrounds ce qui sera
+suffisant pour
+une bonne calibration des modèles.
+Il n'est pas nécessaire de faire plusieurs répétitions, car le nombre de 
+points de background est déjà suffisamment élevé, les résultats de calibration
+ne varieraient pas entre différentes répétitions.
+
+
+Il existe un biais d'échantillonnage sur les occurrences de chiroptères,
+qui peut influencer les résultats des modèles. Pour corriger ce biais,
+deux options sont possibles : prendre en compte l'accessibilité (distance aux
+routes) ou prendre en compte la pression d'échantillonnage sur tout le groupe.
+C'est cette méthode que nous allons utiliser ici, en intégrant le biais 
+d'échantillonnage
+dans la génération des points de background. Cela va ainsi éviter aux modèles
+d'expliquer le biais d'échantillonnage avec les variables environnementales.
+
+Pour cela, il faut générer une couche qui reflète la probabilité 
+d'échantillonnage. Nous avons généré cette couche en utilisant toutes les
+occurrences de chiroptères de Corse. Il s'agit de la méthode appelée "biais du
+groupe cible" (target-group
+sampling bias). Nous utilisons ensuite cette couche pour échantillonner les 
+points de background en Corse.
+
+Etant donné que la Corse ne possède qu'un nombre limité de cellules,
+nous réduisons le nombre de backgrounds tirés à 6000 afin que le biais produise
+un effet (sinon quasiment toutes les cellules de la Corse sont échantillonnées,
+ce qui supprime l'effet du biais).
+
+
+```{r, fig.height = 10, fig.width = 6}
+# On réduit le nombre de background pour avoir un effet du biais
+background <- spatSample(env_corse[["occ_density_chiro"]],
+                         method = "weights",
+                         size = 6000,
+                         replace = FALSE, # Pas de remise
+                         na.rm = TRUE, # Pas dans les données manquantes
+                         xy = TRUE, # L'output inclut les coords XY
+                         values = FALSE) # L'output exclut les variables
+
+# On ajoute les points de background aux données de présence
+P_points <- rbind.data.frame(P_points,
+                             data.frame(background, 
+                                        occurrence = 0))
+
+# Affichage des occurrences
+plot(P_points$y ~ P_points$x, pch = c(1, 16)[P_points$occurrence + 1], 
+     asp = 1, cex = .5,
+     xlab = "Longitude", ylab = "Latitude")
+```
+
+Les points de background sont les cercles blancs, et les occurrences sont
+les cercles pleins. 
+
+
+
+# Sélection des variables environnementales
+
+
+
+##  Climat
+
+Les chauves-souris sont dépendantes des conditions climatologiques pour la sélection de leurs abris et sites de nichage et pour leur activité. Les études macroécologiques suggèrent que les chiroptères préfèrent des températures douces à chaudes et un degré d’humidité élevé (McCain, 2006), et les variables de température et de précipitation sont systématiquement utilisées comme des prédicteurs pertinents dans les modèles de distribution de chiroptères. Nous utiliserons donc des variables reflétant les limites potentielles qui empêchent l’occurrence des chiroptères, avec l’hypothèse que les espèces préfèrent des conditions intermédiaires, douces et humides : effet limitant des températures trop froides ou trop chaudes (températures les plus chaudes et les plus froides de la saison d’activité), effet limitant de l’humidité relative (humidité relative minimale et maximale).
+
+Noms des variables retenues :
+
+ - températures les plus chaudes de l'année (*bio5*)
+ 
+ - températures les plus froides sur la saison estivale (*tasmin_chiro*)
+ 
+ - humidité relative minimale (*cmi_min*) et maximale (*cmi_max*).
+
+
+
+##  Occupation du sol
+
+Ces deux espèces présentent une activité principalement liée aux milieux humides notamment pour leur comportement alimentaire, et utilisent une diversité de microhabitats pour leurs gîte de repos et de reproduction : cavités et anfractuosités naturelles (e.g., roche, arbres) et artificielles (e.g., murs, volets, combles). Ainsi, nous attendons surtout une dépendance très forte aux milieux humides, avec une probabilité d'observation augmentant avec la proximité aux zones humides. A l'inverse, l'effet des autres variables d'occupation du sol (cavités, forêts, bâti peu dense) sera testé mais risque d'être difficile à observer étant la faible spécificité du choix du microhabitat pour ces espèces. Nous explorerons également l'effet de la diversité d'occupation du sol comme pour les autres groupes de chiroptères.
+
+Enfin, la connectivité peut beaucoup jouer sur la présence des chauves-souris en leur permettant de se déplacer ; nous utiliserons donc la variable de continuité spatiale développée par l'IUCN (Guetté et al. 2021) en supposant un effet positif de la connectivité sur la probabilité d'observer les espèces.
+
+
+Noms des variables retenues :
+
+ - distance aux zones humides (*dist_moy_pzh*)
+ 
+ - distance aux forêts (*dist_forets*)
+ 
+ - distance aux cavités (*dist_cavites*)
+ 
+ - distance au bâti peu dense (*dist_bati_peu_dense*)
+ 
+ - homogénéisation du paysage (*simpson_landscapediv*) 
+ 
+ - connectivité (*connectivite*)
+
+##  Biais d'échantillonnage
+
+
+Pour prendre en compte le biais potentiel d'échantillonnage, nous utiliserons la probabilité d'échantillonnage basée sur la méthode dite du "biais d'échantillonnage du groupe cible". Cette méthode consiste à utiliser toutes les occurrences du groupe cible dans la zone d'étude pour spatialiser le biais d'échantillonnage, en utilisant une fonction kernel bi-dimensionnelle. Nous avons construit cette cette variable de biais d'échantillonnage en utilisant les occurrences de tous les chiroptères sur toute la Corse. Elle sera utilisée pour simuler les points de background avec le même biais d'échantillonnage. 
+
+##  Variables anthropogéniques
+
+La pollution lumineuse affecte de manière différente les chauves-souris : certaines espèces sont très négativement impactées, tandis que d’autres y semblent insensibles voire en bénéficient (Azam et al., 2016). Par ailleurs, il est probable que les espèces de ce groupe utilisent le bâti humain pour gîter, ce qui peut interagir avec l’effet de la pollution lumineuse, créant de l’incertitude sur la relation. Nous testerons l’effet de ces deux variables. 
+
+Noms des variables retenues :
+
+ - pollution lumineuse (*pollum*)
+ 
+ - zones artificielles (*zones_artif*)
+
+
+##  Autres variables et commentaires
+
+Les chauves-souris régissent leur activité en fonction du vent, préférant les périodes où le vent est faible (Barré et al. 2023). Ainsi, il est attendu qu'elles aient moins de chance d'occuper les zones fortement ventées ou sujettes aux rafales excessives. Nous testerons donc s'il existe un effet négatif des variables correspondant aux vitesses de vent.
+
+Noms des variables retenues :
+
+ - Vitesse du vent mensualisée maximale sur l'année (*sfcWind_max*)
+
+
+## Constitution du jeu de variables finales pour les chiroptères de zones humides
+
+### Préparation des rasters
+
+```{r}
+env_chirozh <- env_corse[[c("bio5",
+                            "tasmin_chiro",
+                            "cmi_min",
+                            "cmi_max",
+                            "dist_moy_pzh",
+                            "dist_forets",
+                            "dist_cavites",
+                            "dist_bati_peu_dense",
+                            "simpson_landscapediv",
+                            "connectivite",
+                            "pollum",
+                            "zones_artif",
+                            "sfcWind_max")]]
+```
+
+
+### Etude de la colinéarité et réduction du nombre de variables
+
+La colinéarité est la corrélation qui existe entre les variables 
+environnementales. Des variables colinéaires posent des problèmes pour la
+calibration de nombreux modèles statistiques, donc on s'assure toujours 
+d'éliminer les variables colinéaires avant de faire la calibration.
+
+On étudie la colinéarité entre les variables avec le coefficient de corrélation
+de Spearman (car certaines variables ne sont pas distribuées normalement),
+en utilisant un seuil standard de 0.7. 
+
+```{r fig.height = 10, fig.width = 10}
+var_groups <- removeCollinearity(env_chirozh,
+                                 plot = TRUE,
+                                 multicollinearity.cutoff = 0.7,
+                                 method = "spearman")
+```
+
+Seules deux variables sont corrélées fortement : tasmin_chiro (température 
+minimale
+sur la saison estivale) et la connectivité. Nous conserverons seulement
+tasmin_chiro ici car son effet
+est supposé plus important que celui de la connectivité sur la probabilité de
+survie des espèces.
+
+```{r}
+env_chirozh <- env_chirozh[[-which(names(env_chirozh) == 
+                                             "connectivite")]]
+
+```
+
+
+Au total il y a 11 variables environnementales, pour seulement 
+`r length(which(P_points$occurrence == 1))` occurrences, 
+ce qui est excessif. Une règle simple est de garder une variable pour 10 
+occurrences. Nous allons donc réduire le nombre de variables à 7, en gardant
+les variables suivantes :
+
+ - distance aux zones humides, habitat principal de ces espèces
+
+ - variables de climat *bio5*, *tasmin_chiro*, *cmi_min*, *cmi_max* qui ont des
+ effets
+ démontrés chez les chiroptères
+ 
+ - pollution lumineuse 
+ 
+ - régimes de vent, car les zones humides sont susceptibles d'être exposées au
+ vent en raison de la végétation basse
+ 
+Nous éliminons donc les variables d'habitat pour lesquelles les hypothèses sont
+faibles. 
+
+
+```{r}
+env_chirozh <- env_chirozh[[c("bio5",
+                              "tasmin_chiro",
+                              "cmi_min",
+                              "cmi_max",
+                              "dist_moy_pzh",
+                              "pollum",
+                              "sfcWind_max")]]
+```
+
+
+### Filtrage des variables non informatives
+
+[Les analyses préliminaires](http://borisleroy.com/sdms_pna_corse/SDMs_chiropteres_zoneshumides_v1.html) 
+ont révélé que l'une de ces variables n'avait pas ou peu d'effet : *pollum*.
+Cette variable a donc été éliminée.
+
+
+```{r}
+env_chirozh <- env_chirozh[[c("bio5",
+                              "tasmin_chiro",
+                              "cmi_min",
+                              "cmi_max",
+                              "dist_moy_pzh",
+                              "sfcWind_max")]]
+```
+
+
+
+# Préparation de la stratégie de validation croisée des modèles
+
+Nous ne disposons pas de jeu de données indépendant pour évaluer les modèles.
+Par conséquent, il nous faut utiliser une procédure de "validation croisée" qui
+consiste à séparer le jeu de données en deux, une partie sert à la calibration
+des modèles, et l'autre partie sert à l'évaluation. L'approche classique 
+consiste à faire de découpage de manière aléatoire, mais il a été démontré qu'un
+découpage aléatoire est suroptimiste car les points de données de calibration
+sont très proches, spatialement, des points de données d'évaluation.
+
+Pour éviter ce problème de proximité spatiale, nous allons utiliser une
+procédure dite de "validation croisée spatiale par blocs". Cette validation 
+croisée par blocs vise à réduire l'autocorrélation spatiale entre jeu de données 
+de calibration et jeu de validation. L'autocorrélation spatiale est le fait que
+des points proches dans l'espace ont des valeurs de variables environnementales
+similaires. Eviter l'autocorrélation spatiale entre jeu de calibration et 
+d'évaluation revient à éviter que les valeurs de variables environnementales
+soient similaires entre calibration et évaluation - cela permet de mieux tester
+la réelle capacité des modèles à prédire l'habitat favorable aux espèces.
+
+
+La démarche de validation croisée par blocs est la suivante :
+
+1. Définir une taille de blocs qui réduit l'autocorrélation spatiale entre
+calibration et évaluation
+
+2. Répartir les blocs en plis ("folds") de calibration et d'évaluation
+
+3. Vérifier que les plis sont équilibrés, i.e. le nombre de points de 
+calibration doit être similaire entre les plis. Si les plis sont déséquilibrés,
+recommencer les étapes 1-3 en réduisant la taille des blocs.
+
+## Définition de la taille des blocs
+
+Il faut étudier le degré d'autocorrélation spatiale dans les variables 
+environnementales pour avoir une idée de la taille des blocs. La taille des 
+blocs est un compromis entre l'objectif de diminution de l'autocorrélation 
+spatiale et les contraintes des données d'occurrences. En effet, si toutes
+les occurrences sont localisées dans une petite zone, il ne sera pas possible de
+viser des blocs trop grands, car on ne pourrait alors pas séparer les points en 
+jeu de calibration et jeu d'évaluation.
+
+
+
+```{r warning = FALSE}
+# Pour étudier la taille des blocs à viser, il faut d'abord projeter le raster
+# en mètres, sinon la fonction de calcul de l'autocorrélation échouera
+env_chirozh_l93 <- project(env_chirozh,
+                               "EPSG:2154") # Projection en Lambert 93 ici
+
+# Ensuite on étudie le range d'autocorrélation spatiale
+AC_range <- cv_spatial_autocor(env_chirozh_l93,
+                               num_sample = 10000)
+```
+
+On obtient initialement un range médian qui est de 
+`r round(AC_range$range / 1000, 1)` km, ce qui est  
+satisfaisant ici pour réaliser une validation croisée par blocs : il y a 
+beaucoup de blocs, ce qui signifie que la répartition des blocs en plis sera 
+probablement bien équilibrée.
+
+```{r warning=FALSE,}
+P_points_sf <- st_as_sf(P_points, 
+                        coords = c("x", "y"), 
+                        crs = "EPSG:4326")
+
+plis_cv <- cv_spatial(x = P_points_sf,
+                      column = "occurrence", # Nom de la colonne des occurrences
+                      k = 6, # Nombre de plis (folds) pour la k-fold CV
+                      size = AC_range$range, # Taille des blocs en metres
+                      selection = "random", # Attribution des blocs aléatoire dans 
+                      # les plis
+                      iteration = 50, # Nombre d'essais pour trouver des plis
+                      # équilibrés
+                      biomod2 = TRUE, # Formater les données pour biomod2
+                      r = env_chirozh, # Pour le fond de carte
+                      progress = FALSE) 
+
+```
+
+On voit que nos plis sont plutôt 
+`r ifelse(max((plis_cv$records$train_1 - median(plis_cv$records$train_1)) / median(plis_cv$records$train_1)) > 0.3, "déséquilibrés", "équilibrés")` :
+								  
+
+ - de `r min(plis_cv$records$train_1)` à `r max(plis_cv$records$train_1)` présences pour la calibration
+ 
+ - de `r min(plis_cv$records$test_1)` à `r max(plis_cv$records$test_1)` présences pour 
+l'évaluation
+
+On peut visualiser la répartition des points de calibration ("Train") et 
+évaluation ("Test") pour chaque pli sur la carte suivante : 
+
+```{r warning=FALSE,}
+cv_plot(plis_cv, x = P_points_sf)
+```
+
+Cette carte inclut à la fois les présences et les backgrounds.
+
+
+Dernière étape, biomod2 exige un format particulier pour les plis de validation
+croisée, donc on va préparer ce format ici :
+
+```{r}
+table_cv <- plis_cv$biomod_table
+colnames(table_cv) <- paste0("_allData_", 
+                             colnames(table_cv))
+```
+
+
+# Calibration des modèles
+
+Tout d'abord on prépare les données pour biomod2.
+
+```{r}
+coorxy <- P_points[, c("x", "y")]
+occurrences <- P_points[, "occurrence"]
+
+
+dir.create("models/chirozh", recursive = T, showWarnings = FALSE)
+
+run_data <- BIOMOD_FormatingData(
+  resp.name = "chirozh", # Nom de l'espèce
+  resp.var = occurrences, # Présences + background
+  expl.var = env_chirozh, # Variables environnementales prédictives
+  dir.name = "models", # Dossier dans lequel on va stocker les modèles
+  resp.xy = coorxy, # Coordonnées xy des présences et background
+  PA.strategy = NULL) # Pas de génération de points de background par biomod
+# Car on en a généré nous-mêmes
+
+saveRDS(run_data, file = paste0("models/chirozh/run_data.RDS"))
+```
+Biomod nous indique deux choses : que nous n'avons pas de données indépendantes
+pour l'évaluation, ce qui est effectivement le cas à ce stade de l'étude.
+Par ailleurs, que plusieurs données peuvent être dans la même cellule, ce qui 
+est également attendu car nous avons tiré aléatoirement nos background dans
+toute la zone d'étude et donc ils ont pu tomber dans les mêmes cellules que des 
+points de présence. Pas d'inquiétudes, c'est ce que l'on avait prévu.
+
+On va pouvoir désormais préparer la calibration des modèles, en les paramétrant
+de manière correcte. Ce qui est important de savoir ici c'est que nos modèles
+vont avoir deux grosses difficultés statistiques :
+
+ - *déséquilibre des classes* : il y a au total
+ `r length(which(occurrences == 1))` présences et 
+  `r length(which(occurrences == 0))` backgrounds (qui seront
+ considérés comme des valeurs de 0 par les modèles), ce qui crée un gros 
+ déséquilibre entre les 1 et les 0. C'est ce que l'on appelle le déséquilibre
+ des classes.
+ 
+ - *chevauchement des classes* : il est probable que les présences et les
+ backgrounds se chevauchent sur les gradients de variables environnementales
+ (d'autant plus que nous pouvons avoir parfois une présence et un background
+ dans le même pixel), ce qui rend la distinction entre les 1 et les 0 difficile
+ pour les modèles. C'est ce que l'on appelle le chevauchement des classes.
+ 
+La solution pour bien paramétrer les modèles face au déséquilibre et au
+chevauchement varie selon les modèles, mais le principe général est de réduire
+l'importance des backgrounds lors de la calibration par rapport au présence,
+afin de viser un ratio équilibre 50/50 entre importance des présences et 
+importance des backgrounds. Par exemple, on va attribuer des poids
+aux présences et aux backgrounds de sorte que la somme du poids des présences
+et des backgrounds soit égale. Cependant, cette méthode fonctionne mal sur 
+certains modèles comme le random forest, et il faut alors le paramétrer de 
+manière plus fine avec un rééchantillonnage à 50/50 en interne. 
+
+Par ailleurs, il est important de noter que l'évaluation des modèles avec la
+validation croisée n'est pas un élément validant la robustesse du modèle. Elle
+est plutôt à considérer comme un élément qui élimine les mauvais modèles, mais
+elle ne constitue pas une preuve de robustesse quand elle est bonne, car elle
+est limitée à la fois par la nature des données (présence-seule, pas 
+d'absences), et par la possibilité qu'il y ait des biais dans 
+l'échantillonnage. Ainsi, il est difficile d'utiliser la validation croisée
+pour identifier les meilleurs modèles ; il vaut mieux donc se baser sur des 
+paramètres établis pour être robustes en situation de présence-seule (e.g.,
+Valavi et al. 2021).
+ 
+Préparons donc la calibration de nos modèles :
+
+
+ 
+```{r warning=FALSE,message=FALSE}
+calib_summary <- 
+  summary(run_data, calib.lines =  table_cv) %>% 
+  filter(dataset == "calibration")
+
+iwp <- (10^6)^(1 - occurrences)
+
+
+RF_param_list <- NULL
+GLM_param_list <- NULL
+GBM_param_list <- NULL
+XGBOOST_param_list <- NULL
+XGBOOST_param_list <- NULL
+GAM_param_list <- NULL
+MARS_param_list <- NULL
+XGBOOST_param_list <- NULL
+for (cvrun in 1:nrow(calib_summary)) {
+  
+  prNum <- calib_summary$Presences[cvrun]
+  bgNum <- calib_summary$True_Absences[cvrun]
+
+  wt <- ifelse(occurrences == 1, 1, prNum / bgNum)
+
+  RF_param_list[[paste0("_",
+                        calib_summary$PA[[cvrun]],
+                        "_",
+                        calib_summary$run[[cvrun]])]] <-
+    list(ntree = 1000,
+         sampsize =  c("0" = prNum,
+                       "1" = prNum),
+         replace = TRUE)
+  
+  GLM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-
+    list(weights = wt)
+  
+  
+  GBM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-
+    list(interaction.depth = 5,
+         n.trees = 5000, 
+         shrinkage = 0.001,
+         bag.fraction = 0.75,
+         cv.folds = 5,
+         weights = wt)
+  
+  GAM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-     
+    list(weights = wt)
+  
+  MARS_param_list[[paste0("_",
+                          calib_summary$PA[[cvrun]],
+                          "_",
+                          calib_summary$run[[cvrun]])]] <- 
+    list(weights = wt)
+  
+  XGBOOST_param_list[[paste0("_",
+                             calib_summary$PA[[cvrun]],
+                             "_",
+                             calib_summary$run[[cvrun]])]] <-
+    list(nrounds = 10000,
+         eta = 0.001,
+         max_depth = 5,
+         subsample = 0.75,
+         gamma = 0,
+         colsample_bytree = 0.8,
+         min_child_weight = 1,
+         weight = wt,
+         verbose = 0)
+}
+
+model_parameters <- bm_ModelingOptions(
+  data.type = "binary",
+  models = c("GLM", "GBM", "GAM.mgcv.gam", "MARS", "RF", "MAXNET", "XGBOOST"),
+  strategy = "user.defined",
+  user.base = "default",
+  user.val = list(
+    GLM.binary.stats.glm = GLM_param_list,
+    GBM.binary.gbm.gbm = GBM_param_list,
+    GAM.binary.mgcv.gam = GAM_param_list,
+    MARS.binary.earth.earth = MARS_param_list,
+    RF.binary.randomForest.randomForest = RF_param_list,
+    XGBOOST.binary.xgboost.xgboost = XGBOOST_param_list
+  ),
+  bm.format = run_data,
+  calib.lines = table_cv
+)
+
+
+
+```
+
+
+
+L'étape précédente sert à définir des paramètres appropriés pour tous les 
+modèles ; cependant, nous n'allons pas utiliser tous les modèles. Nous allons
+maintenant sélectionner les modèles qui seront effectivement lancés. Ce choix
+est basé sur les tests préliminaires qui ont mis en évidence les modèles 
+donnant des résultats cohérents, par rapport aux modèles ne donnant pas des
+résultats cohérents :
+
+ - les modèles GLM, MARS et MAXNET donnaient des réponses biologiquement 
+ irréalistes en U 
+ 
+ - le modèle GAM donnait des réponses monotones pour 
+ toutes les variables, alors que la plupart des autres modèles donnaient 
+ des réponses non linéaires et des courbes en cloche
+ 
+ - le modèle XGBOOST a démontré une forme sévère de surajustement (overfitting)
+ avec seulement quelques cellules à forte favorabilité (les cellules contenant
+ des occurrences) et de très faibles favorabilités pour toutes les autres
+ cellules
+ 
+Au final, deux modèles ont donc été retenus pour ce groupe : RF et GBM.
+ 
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+model_list <- c("RF", "GBM")
+```
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+model_runs <- BIOMOD_Modeling(
+  run_data,
+  modeling.id = "1", # ID de modélisation, on met 1 pour tous nos modèles ici
+  models = model_list, # Liste des modèles finaux à faire tourner
+  OPT.strategy = "user.defined",
+  OPT.user = model_parameters, # Paramètres des modèles
+  CV.strategy = "user.defined", # Méthode de validation croisée
+  CV.user.table = table_cv, # Plis générés précéemment
+  CV.do.full.models = FALSE,
+  var.import = 10, # Nombre de répétitions d'importance des variables
+  metric.eval = "BOYCE",
+  do.progress = FALSE,
+  nb.cpu = 16 # Nombre de coeurs à utiliser pour la modélisation
+  # A ajuster selon votre ordinateur, ne pas en mettre trop !
+)
+saveRDS(model_runs, file = "models/chirozh/model_runs.RDS")
+```
+
+
+# Evaluation des modèles
+
+```{r}
+evals_boyce <- get_evaluations(model_runs)
+ggplot(evals_boyce, aes(x = algo, y = validation)) +
+ geom_point(aes(col = run)) +
+  xlab("Algorithme") +
+  ylab("Indice de Boyce") +
+  labs(col = "Plis de\nvalidation\ncroisée") +
+  ylim(0, 1) +
+  theme_minimal()
+```
+
+L'indice de Boyce est un indice qui varie entre -1 et 1 (-1 = prédictions
+opposées à la réalité, 0 = prédiction nulles, 1 = prédictions parfaites). 
+
+Les évaluations sont correctes mais pas très élevées, suggérant que les
+modèles sont informatifs mais peinent à prédire toutes les occurrences
+des jeux de données d'évaluation. 
+
+
+Il faut néamoins toujours être prudent sur l'interprétation des métriques 
+d'évaluation car il s'agit de modèles corrélatifs et parce que l'évaluation est
+effectuée sur les données d'occurrence qui peuvent être biaisées. Ces métriques
+nous indiquent principalement qu'aucun modèle n'a donné de très mauvais 
+résultats, c'est l'information à en retirer. En revanche, il faut se garder
+de la fausse impression de robustesse que peuvent donner de bonnes métriques,
+car les modèles peuvent faire de bonnes prédictions avec des variables qui
+n'ont pas de sens pour la biologie des espèces. La prochaine étape consiste 
+donc à étudier les réponses des espèces aux variables environnementales.
+
+
+# Importance des variables et courbes de réponse
+
+
+```{r}
+varimp <- get_variables_importance(model_runs)
+
+varimp$expl.var <- reorder(varimp$expl.var,
+                           varimp$var.imp,
+                           median,
+                           na.rm = TRUE)
+
+
+
+varimp %>%
+  group_by(expl.var) %>%
+  summarise(median = median(var.imp))
+
+ggplot(varimp) + 
+  geom_boxplot(aes(x = expl.var, y = var.imp)) +
+  geom_jitter(aes(x = expl.var, y = var.imp, col = algo),
+              alpha = .3) +
+  coord_flip() +
+  theme_minimal() +
+  xlab("Variable prédictive") +
+  ylab("Importance des variables") +
+  labs(col = "Algorithme")
+
+
+```
+
+
+```{r, fig.height = 6, fig.width = 6, warning = FALSE}
+# Variables utilisées pour la calibration
+cur_vars <- model_runs@expl.var.names
+
+# Calcul des courbes de réponse
+resp <- bm_PlotResponseCurves(bm.out = model_runs,
+                              fixed.var = "mean",
+                              data_species = occurrences,
+                              do.plot = FALSE,
+                              do.progress = FALSE)$tab
+
+colnames(resp) <- c("Index", "Variable", "Var.value", "Model", "Response")
+
+for (model in model_list) {
+  p <- ggplot(resp[grep(model, resp$Model), ], 
+              aes(x = Var.value, y = Response))  + 
+    geom_line(alpha = 0.2, aes(group = Model)) + 
+    stat_smooth() +
+    facet_wrap(~ Variable, scales = "free_x") + 
+    theme_bw() + 
+    ylim(0, 1.1) + 
+    xlab("Valeurs des variables") +
+    ylab("Réponse") +
+ ggtitle(model)
+  
+  print(p)
+}
+
+
+```
+
+*Note: la courbe bleue est une aide pour visualiser la tendance, mais la vraie réponse des modèles correspond aux courbes grises*
+
+
+
+Le prédicteur le plus important de la répartition des chiroptères des zones humides est la température estivale la plus chaude, ce groupe préférant des zones où la température moyenne de la journée la plus chaude du mois le plus chaud (bio5) excède 25°C. Les autres facteurs climatiques jouent également, avec une préférence pour les zones qui sont chaudes même en début ou en fin de saison estivale (tasmin_chiro). On observe également une préférence pour les zones qui ne sont pas trop sèches même durant la période déficitaire en pluie, mais qui ne sont pas non plus trop humides durant la période excédentaire en pluie. Ces résultats sont relativement cohérents avec la répartition connue des espèces de ce groupe, essentiellement dans les zones chaudes à basse altitude.
+
+La distance aux zones humides joue un rôle très fort sur la favorabilité de l’habitat, avec une très nette préférence pour les zones proches des zones humides (moins de 500 mètres), ce qui correspond exactement aux attendus pour ce groupe.
+
+Enfin, on observe une légère préférence pour les zones qui ne sont pas trop exposées aux vents les plus forts, ce qui peut traduire une sensibilité des espèces du groupe aux vents excessifs.
+
+
+
+# Cartes
+
+```{r, fig.width = 6, fig.height = 3, message=FALSE, warning=FALSE, results='hide'}
+# On ne va garder que les modèles qui ont un indice de Boyce suffisamment élevé
+models_to_proj <- evals_boyce$full.name[which(evals_boyce$validation >= 0.5)]
+
+
+projection_runs <- BIOMOD_Projection(
+  bm.mod = model_runs, # Modèles calibrés
+  proj.name = "corse", # Nom de la projection actuelle
+  new.env = env_chirozh, # Données environnementales sur lesquelles on projette les modèles
+  models.chosen = models_to_proj, # Modèles à projeter
+  build.clamping.mask = TRUE, # Le clamping mask illustre les zones où les prédictions sont en dehors des valeurs
+  # utilisées lors de la calibration
+  nb.cpu = 4)
+
+cartes_individuelles <- rast("models/chirozh/proj_corse/proj_corse_chirozh.tif")
+
+
+# Rescaling des projections qui dépassent l'intervalle 0 - 1000
+cartes_individuelles[cartes_individuelles < 0] <- 0
+cartes_individuelles[cartes_individuelles > 1000] <- 1000
+
+for(i in 1:ceiling(nlyr(cartes_individuelles) / 2)) {
+  plot(cartes_individuelles[[(i * 2 - 1):
+                               min(nlyr(cartes_individuelles),
+                                   (i * 2))]], 
+       col = viridis::inferno(12))
+}
+
+
+```
+
+# Carte finale
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_finale <- mean(cartes_individuelles)
+ggplot() +
+  geom_spatraster(data = carte_finale) +
+  scale_fill_viridis(option = "inferno") +
+  geom_point(data =  P_points[which(P_points$occurrence == 1), ],
+             aes(x = x, y = y),
+             shape = 21,
+             fill = "#21908CFF",
+             col = "white",
+             size = 1) +
+  ggtitle("Indice de favorabilité final") +
+  xlab("Longitude") + 
+  ylab("Latitude") +
+  theme_minimal()
+```
+
+La carte de l’indice de favorabilité reflète très bien les observations connues de ce groupe. Les nuances de l’indice de favorabilité indiquent de larges zones à favorabilité intermédiaire (couleurs rouge orangées, valeurs comprises entre 500 et 700) dans lesquelles il n’y a pas beaucoup d’occurrences. Cela suggère que ces zones contiennent plusieurs variables favorables (par exemple, climat), mais certaines variables ne le sont probablement pas (par exemple, distance aux zones humides). Ainsi, on observe que les occurrences sont plutôt localisées dans des zones à très fortes valeurs de favorabilité (supérieures à 700) – ces zones contenant la plupart des conditions favorable à la présence du groupe. Ces zones ont une répartition plus restreinte, localisées notamment dans l’est et le centre nord de l’île. La répartition de l’indice de favorabilité sur cette carte a été jugée cohérente par les experts consultés, qui ont malgré tout souligné que les prédictions manquent de précision à l’est, car l’urbanisation réduit probablement leur favorabilité apparente.
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_incertitude <- app(cartes_individuelles, sd)
+ggplot() +
+  geom_spatraster(data = carte_incertitude) +
+  scale_fill_continuous(type = "viridis") +
+  ggtitle("Incertitude\n(écart-type des probabilités)") +
+  theme_minimal()
+```
+
+
+On peut noter une limite principale sur cette carte de favorabilité, qui est que certaines occurrences dans le centre-ouest sont localisées dans des zones à favorabilité faible ou méconnue. On note une forte incertitude ponctuelle sur ces zones dans les prédictions des modèles, ce qui suggère que les conditions dans ces zones sont probablement difficiles à modéliser car trop différentes de la plupart des autres observations du groupe. On peut supposer que ces observations peuvent correspondre à des occurrences accidentelles (e.g., individus en dispersion) plutôt qu’à des habitats occupés de manière permanente. Il serait utile de vérifier cette hypothèse par une validation terrain pour vérifier s’il s’agit bien de zones non occupées. Si, au contraire, ces zones sont occupées de manière stable, dans ce cas cela suggèrerait que les relations prédites par le modèle sont incomplètes, et que le groupe peut occuper des habitats plus larges que ce que les données actuelles suggèrent. Une autre limite potentielle de ces résultats est la présence de zones à forte favorabilité dans lesquelles il n’y a pas d’observation connue, notamment à l’ouest, au sud-ouest et au sud-est de l’île. L’absence d’observations dans ces zones peut s’expliquer par deux hypothèses principales : absence d’effort d’échantillonnage ou non prise en compte de variables qui empêchent les chiroptères des zones humides d’occuper ces zones (e.g., perturbations anthropiques, qualité des zones humides, disponibilité en ressources, etc.). Encore une fois, une validation terrain serait importante pour tester ces hypothèses.
+
+Les autres éléments notables de la carte d’incertitude suggèrent des difficultés à prédire les indices intermédiaires de favorabilité de l’habitat, avec de larges bandes à incertitude élevée autour des zones favorables (zones de couleur turquoise, valeurs entre 100 et 200 sur la figure incertitudes, à analyser en parallèle de la carte moyenne). Cette incertitude pour les valeurs intermédiaire est attendue pour ce type de modèles, surtout quand les données d’occurrences sont limitées.
+
+
+## Carte de potentiel d'habitat
+
+Pour créer la carte de potentiel d'habitat final, nous allons représenter 
+trois catégories de potentiel d'habitat, en respectant les contraintes 
+d'interprétation sur les modèles en présence seule. En effet, les modèles en
+présence seule ne peuvent pas fournir d'information sur la probabilité de
+présence. Par conséquent, ils ne peuvent informer sur les habitats défavorables 
+- ils informent seulement sur les habitats favorables compte-tenu des 
+connaissances actuelles.
+
+Ainsi, nous ne produirons pas de carte binaire "présence-absence" qui n'aurait
+pas de sens dans le cadre des modèles en présence-seule et qui est également une
+sur-simplification de la réalité biologique, qui n'est jamais binaire.
+Nous allons plutôt
+représenter trois catégories : 
+
+ - les zones à fort potentiel d'habitat
+ - les zones à potentiel d'habitat intermédiaire 
+ - les zones à potentiel d'habitat faible ou méconnu
+ 
+Pour établir une méthode permettant de définir ces trois catégories, on peut
+étudier comment les occurrences sont réparties sur le gradient de favorabilité
+des modèles. On peut alors utiliser les quantiles des occurrences pour 
+identifier les seuils séparant les catégories.
+
+
+```{r, fig.width = 6, fig.height = 2, message = FALSE}
+favorabilite_presences <- extract(carte_finale,
+                                  P_points[which(P_points$occurrence == 1),
+                                           c("x", "y")],
+                                  ID = FALSE)
+
+qt_favorabilite <- quantile(favorabilite_presences$mean, probs = c(.05, .25))
+
+ggplot(favorabilite_presences) +
+  geom_boxplot(aes(x = mean),
+               col = "darkgrey") +
+  geom_vline(xintercept = qt_favorabilite,
+             col = c("#1b9e77", "#7570b3"),
+             linetype = 2,
+             linewidth = 2) +
+  theme_minimal() +
+  xlab("Indice de favorabilité") +
+  scale_y_continuous(breaks = 0,
+                     labels = "Occurrences") +
+  xlim(0, 1000)
+```
+Dans le graphe ci-dessus, on voit la répartition des occurrences sur l'indice
+de favorabilité produit par le modèle. On peut utiliser les quantiles à 5% et 
+25% (représentés par les pointillés bleus) pour séparer les catégories. 
+
+ - La zone à droite du quantile à 25% (le trait mauve) contient l'essentiel des 
+ occurrences du groupe d'espèces, ce qui signifie qu'au delà de ce seuil, 
+ le **potentiel d'habitat est élevé**. 
+
+ - La zone entre le quantile à 5% (trait vert) et à 25% (trait mauve) est une
+ zone à favorabilité plus faible mais qui contient tout de même 20% des 
+ occurrences du groupe. On peut ainsi la caractériser comme **zone à potentiel
+ d'habitat intermédiaire**. 
+ 
+ - La zone à gauche du quantile à 5% (trait vert) contient moins de 5% des
+ occurrences du groupe. Il s'agit donc de valeurs de favorabilité plutôt faibles
+ puisqu'elles ne semblent pas ou peu occupées d'après les connaissances 
+ actuelles. On peut donc qualifier cette catégorie de **potentiel d'habitat 
+ faible ou méconnu**.
+ 
+ Si l'on utilise ces seuils pour illustrer la répartition de ces trois 
+ catégories, on obtient la carte suivante :
+
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_indice <- carte_finale
+carte_indice[carte_finale < qt_favorabilite["5%"]] <- 0
+carte_indice[carte_finale >= qt_favorabilite["5%"] &
+               carte_finale < qt_favorabilite["25%"]] <- 1
+carte_indice[carte_finale >= qt_favorabilite["25%"]] <- 2
+
+carte_indice <- as.factor(carte_indice)
+
+ggplot() + 
+  geom_spatraster(data = carte_indice) +
+  theme_minimal() +
+  scale_fill_manual(values = viridis::plasma(3),
+                    name = paste0("Potentiel d'habitat\n(% du total ",
+                                  "d'occurrences\n",
+                                  "observé dans cette classe\n",
+                                  "de favorabilité)"),
+                    labels = c("Faible ou méconnu (< 5%)",
+                               "Intermédiaire (5-25%)",
+                               "Elevé (75%)"),
+                    na.translate = F)
+
+```
+
+La carte de potentiel d’habitat illustre que la zone qui présente le potentiel d’habitat le plus élevée – couvrant 75% des observations connues pour ce groupe – est très restreinte, ce qui illustre bien l’analyse précédente sur l’indice de favorabilité : seules les zones à plus fort indice (supérieur à 650 environ) présentent un fort potentiel d’habitat. Cette répartition restreinte est cohérente avec le faible nombre d’observations connues pour ce groupe. Les zones à potentiel d’habitat intermédiaire – correspondant à des indices de favorabilité plus faible mais comprenant tout de même 20% des observations connues de ce groupe – sont également limitées à quelques zones en périphérie des zones à fort potentiel d’habitat. 
+
+# Sauvegarde des cartes en fichiers SIG
+
+```{r}
+writeRaster(carte_finale,
+            "outputs/carte_chirozh_indicemoy.tif", overwrite = TRUE)
+writeRaster(carte_incertitude,
+            "outputs/carte_chirozh_incertitude.tif", overwrite = TRUE)
+writeRaster(carte_indice,
+            "outputs/carte_chirozh_potentielhabitat.tif", overwrite = TRUE)
+
+```

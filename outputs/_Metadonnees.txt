@@ -1,0 +1,44 @@
+#### Cartes d'habitat potentiels pour les groupes d'espèces ####
+
+Leroy Boris. 2024. Cartographie prédictive des habitats des groupes d’espèces 
+ciblées par les Plans Nationaux d’Actions en Corse. Rapport pour la DREAL de 
+Corse. Zenodo. 110 pp. https://doi.org/10.5281/zenodo.11067678
+
+La méthodologie d'obtention de ces cartes est détaillée dans le rapport 
+ci-dessus et pour chaque groupe d'espèces dans les scripts Rmarkdown 
+disponibles à cete adresse : https://borisleroy.com/sdms-pna-corse/
+
+
+Pour chaque groupe d'espèces il y a trois cartes :
+
+ - carte_<groupe>_indicemoy.tif
+
+Cette carte correspond à l'indice moyen de favorabilité de l'habitat entre 
+tous les modèles. Sa valeur est comprise entre 0 et 1000 ; une valeur de 0 
+indique une favorabilité faible ou méconnue, tandis qu'une valeur de 1000 
+indique une favorabilité très élevée.
+ 
+ - carte_<groupe>_incertitude.tif
+ 
+Cette carte correspond à l'incertitude (écart-type) sur l'indice de favorabilité
+de l'habitat entre tous les modèles.
+ 
+ - carte_<groupe>_potentielhabitat.tif
+ 
+Cette carte correspond à l'indice de potentiel d'habitat final, qui est 
+calculé en regardant la distribution des occurrences sur l'indice de 
+favorabilité moyen. Cette carte contient trois valeurs :
+
+  •	Valeur 2 : Zones à fort potentiel d'habitat. Ces zones correspondent 
+  aux valeurs de favorabilité qui contiennent l’essentiel des occurrences du 
+  groupe d’espèces (i.e., 75% des occurrences connues du groupe ont une 
+  favorabilité supérieures à ce seuil). 
+
+  •	Valeur 1 : Zones à potentiel d'habitat intermédiaire. Ces zones ont une 
+  favorabilité plus faible que les zones à valeur 2, mais elles contiennent tout
+  de même 20% des occurrences du groupe. 
+
+  •	Valeur 0 : Zones à potentiel d'habitat faible ou méconnu. Ces zones 
+  contiennent les valeurs de favorabilité les plus faibles, qui ne semblent pas
+  ou peu occupées, puisqu'elle contiennent moins de 5% des occurrences du 
+  groupe. 

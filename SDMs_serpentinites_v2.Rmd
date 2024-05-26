@@ -1,0 +1,1136 @@
+---
+title: "Plantes des serpentinites"
+author: "Boris Leroy"
+date: "`r format(Sys.time(), '%d/%m/%y')`"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    toc: yes
+    df_print: paged
+---
+### *Note sur ce template Rmarkdown*
+
+
+Ce fichier constitue un gabarit complet pour la modélisation des habitats 
+potentiels d'une espèce ou d'un groupe d'espèce. [**Il est fourni sous licence 
+libre CC-BY 4.0**.](https://creativecommons.org/licenses/by/4.0/)
+
+Vous êtes autorisé à :
+
+**Partager** — copier, distribuer et communiquer le matériel par tous moyens
+et sous tous formats pour toute utilisation, y compris commerciale.
+**Adapter** — remixer, transformer et créer à partir du matériel pour toute
+utilisation, y compris commerciale.
+L'Offrant ne peut retirer les autorisations conférées par la licence tant 
+que vous appliquez les termes de cette licence.
+
+Selon les conditions suivantes :
+
+**Attribution** — Vous devez créditer ce travail, intégrer un lien vers la 
+licence et indiquer si des modifications ont été effectuées à ce code.
+Vous devez indiquer ces informations par tous les moyens raisonnables, sans 
+toutefois suggérer que l'Offrant vous soutient ou soutient la façon dont 
+vous avez utilisé son code.
+
+**Partage dans les Mêmes Conditions** — Dans le cas où vous effectuez un 
+remix, que vous transformez, ou créez à partir du matériel composant le code
+original, vous devez diffuser le code modifié dans les même conditions,
+c'est à dire avec la même licence avec laquelle le code original a été
+diffusé.
+
+**Pas de restrictions complémentaires** — Vous n'êtes pas autorisé à 
+appliquer des conditions légales ou des mesures techniques qui 
+restreindraient légalement autrui à utiliser le code dans les conditions 
+décrites par la licence. 
+
+
+
+Il a été testé fonctionnel sur la version de R `r R.version.string`, avec les packages
+sf (`r packageVersion("sf")`), terra (`r packageVersion("terra")`), ggplot2 
+(`r packageVersion("ggplot2")`), scales (`r packageVersion("scales")`), egg 
+(`r packageVersion("egg")`), virtualspecies 
+(`r packageVersion("virtualspecies")`), blockCV 
+(`r packageVersion("blockCV")`), biomod2 (`r packageVersion("biomod2")`),
+dplyr (`r packageVersion("dplyr")`), tidyterra (`r packageVersion("tidyterra")`), viridis 
+(`r packageVersion("viridis")`). 
+
+Il est possible que des évolutions futures de packages (notamment, biomod2, qui 
+est sujet à de nombreuses évolutions en 2023 et 2024) rendent certaines parties
+du fichier non fonctionnelles, ce qui nécessitera de corriger le code.
+
+
+
+# Pré-requis :
+
+Chargement des packages et fonctions, chargement de données géographiques et
+des variables environnementales harmonisées
+
+```{r message=FALSE, warning=FALSE}
+library(sf)
+library(terra)
+library(ggplot2)
+library(scales)
+library(egg)
+library(virtualspecies)
+library(blockCV)
+library(biomod2)
+library(dplyr)
+library(tidyterra)
+library(viridis)
+source("scripts/functions.R")
+
+# Shapefile de la Corse
+corse <- st_read("data/corse.gpkg")
+# Données environnementales harmonisées
+env_corse <- rast("data/env_corse_total_sync.tif")
+```
+
+# Chargement et préparation des données d'occurrence
+
+```{r fig.height=3, fig.width=6, message=FALSE, warning=FALSE}
+serpentinites <- st_read("data/donnees_brutes/taxa/serpentinites.shp")
+# 123 données problématiques à supprimer et réajouter avec un autre fichier
+serpentinites <- serpentinites[-which(serpentinites$x_centroid < 0), ]
+
+serpentinites$species <- simplify_species_name(serpentinites$nom_valide)
+
+serpentinites <- serpentinites[, c("species", "x_centroid", "y_centroid",
+                                   "date_fin")]
+colnames(serpentinites) <- c("species", "x", "y", "date", "geometry")
+
+# Dates d'échantillonnage
+serpentinites$year <- as.numeric(strtrim(serpentinites$date, 4))
+serpentinites$month <- as.numeric(substr(serpentinites$date, 6, 7))
+
+
+serpentinites2 <- st_read("data/donnees_brutes/taxa/CBNC_serpentinite_erregeom1.shp")
+serpentinites2$species <- simplify_species_name(serpentinites2$nom_comple)
+serpentinites2 <- serpentinites2[, c("species", "lon_wgs84", "lat_wgs84",
+                                     "date_relev")]
+
+colnames(serpentinites2) <- c("species", "x", "y", "date", "geometry")
+
+serpentinites2$year <-  as.numeric(substr(serpentinites2$date, 7, 10))
+serpentinites2$month <-  as.numeric(substr(serpentinites2$date, 4, 5))
+
+serpentinites <- rbind(serpentinites,
+                       serpentinites2)
+
+
+# Visualisation de la temporalité des occurrences
+ggplot(serpentinites) +
+  geom_boxplot(aes(x = species,
+                   y = year))+ 
+  coord_flip() +
+  scale_y_continuous(breaks = breaks_pretty()) +
+  theme_minimal()
+```
+
+## Filtre temporel
+
+Il faut établir un filtre temporel pour éliminer les données imprécises, 
+sachant que l'objectif est de modéliser à une résolution assez fine, de l'ordre
+de 1km.
+Le champ `precision` est peu renseigné et donc peu utile ici, il nous faut donc
+poser une hypothèse sur les données qui sont imprécises. On peut considérer que
+les GPS ont commencé à être largement disponibles à partir de 1990, mais leur
+utilisation ne s'est généralisée qu'à partir des années 2000, notamment grâce
+à leur miniaturisation. Ainsi, on peut spéculer qu'avant les années 2000, les
+données étaient moins précisés car possiblement géolocalisées en utilisant des
+référentiels comme les lieu-dits ou les communes, tandis qu'à partir des années
+2000 la précision s'est améliorée grâce à la géolocalisation par satellite.
+
+Le nombre de données supprimées en fixant un seuil à l'année 2000 est 
+limité :
+
+```{r fig.height=10, fig.width=6}
+# Les données avant 2000 représentent un % modéré du jeu de données : 
+100 * length(which(serpentinites$year < 2000)) / nrow(serpentinites)
+```
+
+La couverture temporelle sur l'année est variable selon les années :
+
+```{r fig.height=10, fig.width=10}
+ggplot(serpentinites) +
+  geom_boxplot(aes(x = species,
+                   y = month)) +
+  facet_wrap(~year) + 
+  coord_flip() +
+  scale_y_continuous(breaks = breaks_pretty()) +
+  theme_minimal()
+```
+
+L'emprise spatiale des données d'occurrence ne change pas de manière majeure 
+avec ou sans les données pré-2000 :
+
+```{r fig.height=7, fig.width=10}
+
+p_serpentinites_all <- ggplot() +
+  geom_sf(data = corse) +
+  geom_sf(data = serpentinites, aes(col = year)) +
+  scale_color_continuous(type = "viridis") + 
+  theme_minimal(base_size = 15) +
+  ggtitle("Toutes données\nserpentinites")
+
+p_serpentinites_post2000 <- ggplot() +
+  geom_sf(data = corse) +
+  geom_sf(data = serpentinites[serpentinites$year >= 2000, ], aes(col = year)) +
+  scale_color_continuous(type = "viridis") + 
+  theme_minimal(base_size = 15) +
+  ggtitle("Données post-2000\nserpentinites")
+
+ggarrange(p_serpentinites_all,
+          p_serpentinites_post2000,
+          nrow = 1)
+```
+
+On pose donc l'hypothèse raisonnable qu'un filtre à 2000 va assurer une bonne 
+précision dans la localisation des occurrences sans perdre d'information
+critique sur la répartition des espèces.
+
+```{r}
+serpentinites <- serpentinites[which(serpentinites$year >= 2000), ]
+```
+
+## Rasterisation des occurrences
+
+L'objectif ici est de ne garder qu'une occurrence par cellule à la résolution 
+de nos variables environnementales afin d'éviter une forme extrême de
+pseudo-réplication. Par exemple, si dans une cellule donnée on a initialement
+30 observations de la même espèce, alors, après rasterisation, ces 30 
+observations ne compteront que comme une seule occurrence. Cette étape est
+indispensable car elle évite de donner aux modèles, par exemple, 30 fois la même
+valeur de température provenant d'une seule cellule. C'est ce qu'on appelle
+de la pseudo-réplication et c'est très problématique pour les domaines. 
+On s'attend donc à ce que cette étape réduise le nombre d'occurrences pour les
+modèles.
+
+```{r}
+# On rasterise les occurrences à la résolution de nos variables 
+# environnementales
+serpentinites_r <- rasterize(serpentinites, 
+                             env_corse)
+names(serpentinites_r) <- "serpentinites" # Attention il ne faut pas nommer
+# la couche "serpentinites" car il y a des variables qui s'appellent 
+# serpentinites
+
+plot(serpentinites_r)
+```
+
+On va ensuite éliminer les occurrences qui sont dans des zones sans 
+valeurs de variables environnementales (i.e., essentiellement en zones
+côtières).
+Pour cela on va combiner les variables
+environnementales avec les occurrences rasterisées dans un `data.frame`, et 
+supprimer les occurrences d'espèces qui tombent sur des données 
+environnementales manquantes.
+
+
+On renomme la variable serpentinites pour qu'elle n'ait  pas le même nom que le
+groupe d'espèces :
+
+```{r}
+# On renomme la variable serpentinites pour qu'elle n'ait  pas le même nom que 
+# le groupe d'espèces :
+names(env_corse)[names(env_corse) == "serpentinites"] <-
+  "geol_serpentinites"
+
+# On crée un stack avec nos occurrences rasterisées et les variables env
+env_serpentinites <- c(env_corse,
+                       serpentinites_r)
+
+# On récupère les coordonnées XY de toutes les cellules, pour préparer nos
+# données finales
+coorXY <- xyFromCell(env_corse, 
+                     1:ncell(env_corse))
+# On transforme le raster en data.frame 
+env_serpentinites_df <- values(env_serpentinites)
+
+env_serpentinites_df[is.nan(env_serpentinites_df)] <- NA
+
+# On regarde le nombre d'occurrences pour lesquelles il y a des données 
+# manquantes : 
+length(which(is.na(env_serpentinites_df[, "bio1"]) & 
+               !is.na(env_serpentinites_df[, "serpentinites"])))
+```
+
+On va maintenant supprimer les cellules pour lesquelles on n'a pas de données
+environnementales. Pour cela on va utiliser la première variable
+environnementale ici, car les données manquantes sont toutes les mêmes
+entre toutes les variables environnementales (cf. script harmonisation des
+données).
+
+
+```{r}
+# On filtre d'abord sur l'objet qui contient les coordonnées
+coorXY <- coorXY[-which(is.na(env_serpentinites_df[, 1])), ]
+# Et ensuite sur le tableau avec variables env et présences d'espèces
+env_serpentinites_df <-
+  env_serpentinites_df[which(!is.na(env_serpentinites_df[, 1])), ]
+
+# Comparaison du nombre d'occurrences :
+# Avant rasterisation
+nrow(serpentinites)
+
+# Après rasterisation et élimination des données env manquantes
+length(which(env_serpentinites_df[, "serpentinites"] == 1))
+```
+
+Il s'agit donc du nombre d'occurrences que l'on va pouvoir utiliser pour 
+calibrer nos modèles. Il n'y a que 
+`r length(which(env_serpentinites_df[, "serpentinites"] == 1))``
+occurrences donc on va limiter le nombre de variables utilisées pour les 
+modèles.
+
+On va maintenant formater ces occurrences en combinant
+coordonnées et info sur l'occurrence dans un `data.frame` pour préparer la
+calibration de nos modèles
+
+```{r}
+P_points <- data.frame(
+  # D'abord on récupère les coordonnées XY qui correspondent à nos cellules de présences
+  coorXY[which(!is.na(env_serpentinites_df[, "serpentinites"])), ],
+  # Ensuite, on récupère la colonne qui indique présence pour chaque cellule
+  occurrence = env_serpentinites_df[which(!is.na(env_serpentinites_df[, "serpentinites"])),
+                             "serpentinites"])
+
+P_points
+```
+
+
+# Génération des points de background
+
+Etant donné que nos observations sont des présences-seules, i.e. sans données
+d'absences, il nous faut générer des points de "background" pour pouvoir 
+calibrer les modèles. Ces points de backgrounds sont des données tirées dans
+toute la zone d'étude qui renseignent les modèles sur comment les variables
+environnementales sont distribuées dans la géographie. Ces points seront fournis
+aux modèles comme des 0, ce qui permettra aux modèles d'identifier quels 
+habitats apparaissent comme favorable parmi l'ensemble des habitats disponibles.
+Cependant, ces 0 ne sont pas interprétés comme des absences, et l'interprétation
+finale du modèle nécessitera des précautions particulières, comme par exemple
+ne pas considérer la valeur issue du modèle comme une "probabilité de présence" 
+; elle sera plutôt considérée comme un indice de favorabilité de l'habitat.
+
+La littérature statistique récente suggère que les meilleures pratiques 
+consistent à générer un grand nombre de points de background (e.g., 10000)
+indépendamment de la localisation des points de présence (i.e., un point de 
+background peut être localisé au même endroit qu'un point de présence). Cela
+permet d'assurer une bonne représentation de l'ensemble des conditions 
+environnementales disponibles dans le modèle. Dans le cas de la Corse, le 
+nombre de points de background sera limité par le nombre de pixels disponibles :
+
+```{r}
+# Nous avons éliminé les données manquantes du tableau env_amphib_df
+# Par conséquent, son nombre de lignes est égal au nombre total de pixels 
+# disponibles sur la Corse
+nrow(env_serpentinites_df)
+```
+
+Ainsi, nous partons sur un point de départ à 10000 backgrounds ce qui sera
+suffisant pour
+une bonne calibration des modèles.
+Il n'est pas nécessaire de faire plusieurs répétitions, car le nombre de 
+points de background est déjà suffisamment élevé, les résultats de calibration
+ne varieraient pas entre différentes répétitions.
+
+Il existe un biais d'échantillonnage potentiel sur les occurrences de plantes,
+qui peut influencer les résultats des modèles. Pour corriger ce biais, la 
+méthode la plus adaptée consiste à intégrer le même biais d'échantillonnage
+dans la génération des points de background. Cela va ainsi éviter aux modèles
+d'expliquer le biais d'échantillonnage avec les variables environnementales.
+
+Pour cela, il faut générer une couche qui reflète la probabilité 
+d'échantillonnage. Nous avons généré cette couche en utilisant toutes les
+occurrences de plantes de la base de données du Conservatoire Botanique National
+de Corse. Il s'agit de la méthode appelée "biais du groupe cible" (target-group
+sampling bias). Nous utilisons ensuite cette couche pour échantillonner les 
+points de background en Corse.
+
+Etant donné que la Corse ne possède qu'un nombre limité de cellules,
+nous réduisons le nombre de backgrounds tirés à 6000 afin que le biais produise
+un effet (sinon quasiment toutes les cellules de la Corse sont échantillonnées,
+ce qui supprime l'effet du biais).
+
+```{r, fig.height = 10, fig.width = 6}
+# On réduit également le nombre de background pour avoir un effet du biais
+background <- spatSample(env_corse[["occ_density_cbnc"]],
+                         method = "weights",
+                         size = 6000,
+                         replace = FALSE, # Pas de remise
+                         na.rm = TRUE, # Pas dans les données manquantes
+                         xy = TRUE, # L'output inclut les coords XY
+                         values = FALSE) # L'output exclut les variables
+
+
+# On ajoute les points de background aux données de présence
+P_points <- rbind.data.frame(P_points,
+                             data.frame(background, 
+                                        occurrence = 0))
+
+# Affichage des occurrences
+plot(P_points$y ~ P_points$x, pch = c(1, 16)[P_points$occurrence + 1], 
+     asp = 1, cex = .5,
+     xlab = "Longitude", ylab = "Latitude")
+```
+Les points de background sont les cercles blancs, et les occurrences sont
+les cercles pleins. On note bien la distribution non aléatoire des backgrounds
+qui reflète le biais d'échantillonnage
+
+
+# Sélection des variables environnementales
+
+
+##  Climat
+
+La littérature sur les variables prédictives à utiliser dans les modèles d'habitat pour les plantes est bien établie, et il est essentiel d'utiliser un ensemble de prédicteurs reflétant trois grandes catégories de facteurs climatiques (Mod et al. 2016) : la température, l'eau et le rayonnement solaire. Il est important d'utiliser des variables qui agissent directement sur les plantes (e.g., eau disponible pour les plantes) plutôt que des variables dont l'effet est indirect (e.g., régime de précipitations).
+
+En ce qui concerne la température, les variables reflétant la saisonalité sont préférables aux variables moyennées sur l'année - ainsi nous explorerons l'effet de variables liées à la température reflétant les minimums et maximums annuels, ainsi que les degrés-jours de la saison de croissane des plantes.
+
+En ce qui concerne l'eau, la disponibilité en eau pour les plantes dépend des précipitations, de l'évaporation, et de la nature du substrat, ce qui rend difficile l'obtention d'une variable reflétant réellement la disponibilité en eau. Néanmoins, il existe désormais l'indice d'humidité climatique dans les données CHELSA (Karger et al. 2017), qui reflètent les précipitations moins l'évapotranspiration, et est donc considérée comme une variable bien plus précise de l'eau disponible pour les plantes (Mod et al. 2016) ; nous utiliserons donc cette variable.
+
+Enfin, en ce qui concerne le rayonnement solaire, il est préférable d'utiliser directement le rayonnement solaire plutôt que la pente ou l'exposition ; cependant il faudrait également prendre en compte les effets de la couverture nuageuse et de la saisonalité du rayonnement solaire. Nous utiliserons donc les variables de rayonnement solaire reflétant la saisonnalité sur l'année, et, si possible, la couverture nuageuse (actuellement indisponible, mais devrait être disponible dans CHELSA prochainement).
+
+Noms des variables retenues :
+
+ - températures les plus chaudes (*bio5*) et les plus froides de l'année (*bio6*)
+ 
+ - nombre de jours de la saison de croissance (>10°C) (*ngd5*)
+ 
+ - humidité relative minimale (*cmi_min*) et maximale (*cmi_max*)
+ 
+ - rayonnement solaire mensuel moyen (*rsds_mean*)
+
+
+##  Occupation du sol
+
+La nature du substrat est également une catégorie de facteur indispensable à prendre en compte pour les plantes, mais les données sont souvent parcellaires. Pour ce groupe d'espèces, il existe une hypothèse forte indiquant qu'elles sont inféodées aux zones géologiques de type serpentinites, aussi ce facteur sera inclus comme hypothèse principale expliquant la répartition de ces espèces. Nous explorerons également l'effet de l'altération d'habitat sur ces espèces, avec l'hypothèse que les zones cultivées ou artificielles ont un effet négatif. Pour cela, nous utiliserons le degré d'intégrité biophysique. 
+
+Par ailleurs, il s'agit ici d'espèces inféodées aux milieux ouverts naturels, et donc nous utiliserons la distribution spatiale des milieux ouverts (CORINE Land Cover 332 et 333) pour expliquer la répartition des espèces du groupe.
+
+
+Noms des variables retenues :
+
+ - couche géologique des serpentinites (*geol_serpentinites*)
+ 
+ - degré d'intégrité biophysique (*integrite*)
+ 
+ - milieux ouverts (*zones_ouvertes*)
+
+
+##  Biais d'échantillonnage
+
+Pour prendre en compte le biais potentiel d'échantillonnage, nous utiliserons la probabilité d'échantillonnage basée sur la méthode dite du "biais d'échantillonnage du groupe cible". Cette méthode consiste à utiliser toutes les occurrences du groupe cible dans la zone d'étude pour spatialiser le biais d'échantillonnage, en utilisant une fonction kernel bi-dimensionnelle. Le CBNC nous a fourni les occurrences de toutes les plantes de Corse, ce qui nous a permis de construire cette variable de biais d'échantillonnage. Elle sera utilisée pour simuler les points de background avec le même biais d'échantillonnage. 
+
+
+
+##  Variables anthropogéniques
+
+Il n'y a pas d'hypothèse forte sur la sensibilité de ces espèces aux perturbations anthropiques (hors hypothèse sur l'intégrité biophysique).
+
+
+##  Autres variables et commentaires
+
+Les perturbations dûes au gel hivernal peuvent expliquer les limites supérieures de la végétation. Ainsi, nous testerons si la couverture neigeuse annuelle (nombre de jours sous la neige) semble avoir un effet négatif sur la probabilité d'observer ce groupe.
+
+Noms des variables retenues :
+
+ - Nombre de jours sous la neige (*scd*)
+
+## Constitution du jeu de variables finales pour les plantes des serpentinites
+
+### Préparation des rasters
+
+```{r}
+env_serpentinites <- env_corse[[c("bio5",
+                                  "bio6",
+                                  "ngd5",
+                                  "cmi_min",
+                                  "cmi_max",
+                                  "rsds_mean",
+                                  "geol_serpentinites",
+                                  "integrite",
+                                  "zones_ouvertes",
+                                  "scd")]]
+```
+
+
+
+### Etude de la colinéarité et réduction du nombre de variables
+
+On étudie la colinéarité entre les variables avec le coefficient de corrélation
+de Spearman (car certaines variables ne sont pas distribuées normalement), en utilisant un seuil standard de 0.7. 
+
+```{r fig.height = 10, fig.width = 10}
+var_groups <- removeCollinearity(env_serpentinites,
+                                 plot = TRUE,
+                                 multicollinearity.cutoff = 0.7,
+                                 method = "spearman")
+```
+
+Seules deux variables sont corrélées fortement : bio6 (température minimale
+annuelle) et ngd5 (nombre de degrés-jours lors de la saison de croissance).
+Nous conserverons seulement ngd5 ici car cette variable est conçue 
+spécifiquement pour refléter un effet direct sur le développement des plantes.
+
+```{r}
+env_serpentinites <- env_serpentinites[[-which(names(env_serpentinites) == 
+                                             "bio6")]]
+```
+
+Au total il y a 9 variables environnementales, pour  
+`r length(which(P_points$occurrence == 1))`  occurrences, 
+ce qui est acceptable. 
+
+
+### Filtrage des variables non informatives
+
+[Les modèles préliminaires](http://borisleroy.com/sdms_pna_corse/SDMs_sittelle_v1.html) 
+ont révélé que certaines de ces variables n'ont des effets que très limités :
+couvert neigeux (*scd*), zones ouvertes (*zones_ouvertes*), degrés-jours de la 
+saison de croissance (*ngd5*). Par ailleurs, la variable de température maximale
+(*bio5*) donne des réponses biologiquement incohérentes en U, et donc nous la 
+supprimons également. 
+
+```{r}
+env_serpentinites <- env_corse[[c("cmi_min",
+                                  "cmi_max",
+                                  "rsds_mean",
+                                  "geol_serpentinites",
+                                  "integrite")]]
+```
+
+
+# Préparation de la stratégie de validation croisée des modèles
+
+
+Nous ne disposons pas de jeu de données indépendant pour évaluer les modèles.
+Par conséquent, il nous faut utiliser une procédure de "validation croisée" qui
+consiste à séparer le jeu de données en deux, une partie sert à la calibration
+des modèles, et l'autre partie sert à l'évaluation. L'approche classique 
+consiste à faire de découpage de manière aléatoire, mais il a été démontré qu'un
+découpage aléatoire est suroptimiste car les points de données de calibration
+sont très proches, spatialement, des points de données d'évaluation.
+
+Pour éviter ce problème de proximité spatiale, nous allons utiliser une
+procédure dite de "validation croisée spatiale par blocs". Cette validation 
+croisée par blocs vise à réduire l'autocorrélation spatiale entre jeu de données 
+de calibration et jeu de validation. L'autocorrélation spatiale est le fait que
+des points proches dans l'espace ont des valeurs de variables environnementales
+similaires. Eviter l'autocorrélation spatiale entre jeu de calibration et 
+d'évaluation revient à éviter que les valeurs de variables environnementales
+soient similaires entre calibration et évaluation - cela permet de mieux tester
+la réelle capacité des modèles à prédire l'habitat favorable aux espèces.
+
+
+La démarche de validation croisée par blocs est la suivante :
+
+1. Définir une taille de blocs qui réduit l'autocorrélation spatiale entre
+calibration et évaluation
+
+2. Répartir les blocs en plis ("folds") de calibration et d'évaluation
+
+3. Vérifier que les plis sont équilibrés, i.e. le nombre de points de 
+calibration doit être similaire entre les plis. Si les plis sont déséquilibrés,
+recommencer les étapes 1-3 en réduisant la taille des blocs. 
+
+## Définition de la taille des blocs
+
+Il faut étudier le degré d'autocorrélation spatiale dans les variables 
+environnementales pour avoir une idée de la taille des blocs. La taille des 
+blocs est un compromis entre l'objectif de diminution de l'autocorrélation 
+spatiale et les contraintes des données d'occurrences. En effet, si toutes
+les occurrences sont localisées dans une petite zone, il ne sera pas possible de
+viser des blocs trop grands, car on ne pourrait alors pas séparer les points en 
+jeu de calibration et jeu d'évaluation.
+
+```{r warning = FALSE}
+# Pour étudier la taille des blocs à viser, il faut d'abord projeter le raster
+# en mètres, sinon la fonction de calcul de l'autocorrélation échouera
+env_serpentinites_l93 <- project(env_serpentinites,
+                               "EPSG:2154")
+
+# Ensuite on étudie le range d'autocorrélation spatiale
+AC_range <- cv_spatial_autocor(env_serpentinites_l93,
+                               num_sample = 10000)
+```
+
+On obtient initialement un range médian qui est de 
+`r round(AC_range$range / 1000, 1)` km. Cependant, dans le cas des 
+serpentinites, les populations sont très agrégées sur de petits espaces, ce qui
+crée des déséquilibres dans l'attribution des occurrences entre plis, avec des 
+jeux de données de tests pouvant aller de 2 à plus de 40 occurrences. Ces
+déséquilibres créent de grandes variabilités dans la calibration des modèles et
+rendent impossible l'évaluation de certains plis. 
+
+Pour résoudre ce problème il nous faut réduire la taille des blocs. En
+choisissant une taille de bloc à 5km nous obtenons des répartitions 
+d'occurrences beaucoup plus équilibrées. 
+
+On augmente également le nombre d'itérations pour trouver des plis équilibrés
+afin de maximiser les chances de trouver une répartition équilibrée.
+
+
+```{r warning=FALSE}
+P_points_sf <- st_as_sf(P_points, 
+                        coords = c("x", "y"), 
+                        crs = "EPSG:4326")
+
+plis_cv <- cv_spatial(x = P_points_sf,
+                      column = "occurrence", # Nom de la colonne des occurrences
+                      k = 6, # Nombre de plis (folds) pour la k-fold CV
+                      size = 5000, # Taille des blocs en metres
+                      selection = "random", # Attribution des blocs aléatoire dans 
+                      # les plis
+                      iteration = 500, # Nombre d'essais pour trouver des plis
+                      # équilibrés
+                      biomod2 = TRUE, # Formater les données pour biomod2
+                      r = env_serpentinites, # Pour le fond de carte
+                      progress = FALSE,
+                      plot = FALSE) 
+```
+
+On voit que nos plis sont plutôt 
+`r ifelse(max((plis_cv$records$train_1 - median(plis_cv$records$train_1)) / median(plis_cv$records$train_1)) > 0.3, "déséquilibrés", "équilibrés")` :
+
+ - de `r min(plis_cv$records$train_1)` à `r max(plis_cv$records$train_1)` présences pour la calibration
+ 
+ - de `r min(plis_cv$records$test_1)` à `r max(plis_cv$records$test_1)` présences pour 
+l'évaluation
+
+On peut visualiser la répartition des points de calibration ("Train") et 
+évaluation ("Test") pour chaque pli sur la carte suivante : 
+
+```{r warning=FALSE, fig.height=4, fig.width = 4}
+cv_plot(plis_cv, x = P_points_sf)
+```
+
+Cette carte inclut à la fois les présences et les backgrounds.
+
+Dernière étape, biomod2 exige un format particulier pour les plis de validation
+croisée, donc on va préparer ce format ici :
+
+```{r}
+table_cv <- plis_cv$biomod_table
+colnames(table_cv) <- paste0("_allData_", 
+                             colnames(table_cv))
+```
+
+
+# Calibration des modèles
+
+Tout d'abord on prépare les données pour biomod2.
+
+```{r}
+coorxy <- P_points[, c("x", "y")]
+occurrences <- P_points[, "occurrence"]
+
+
+dir.create("models/serpentinites", recursive = T, showWarnings = FALSE)
+
+run_data <- BIOMOD_FormatingData(
+  resp.name = "serpentinites", # Nom de l'espèce
+  resp.var = occurrences, # Présences + background
+  expl.var = env_serpentinites, # Variables environnementales prédictives
+  dir.name = "models", # Dossier dans lequel on va stocker les modèles
+  resp.xy = coorxy, # Coordonnées xy des présences et background
+  PA.strategy = NULL) # Pas de génération de points de background par biomod
+# Car on en a généré nous-mêmes
+
+saveRDS(run_data, file = paste0("models/serpentinites/run_data.RDS"))
+```
+Biomod nous indique deux choses : que nous n'avons pas de données indépendantes
+pour l'évaluation, ce qui est effectivement le cas à ce stade de l'étude.
+Par ailleurs, que plusieurs données peuvent être dans la même cellule, ce qui 
+est également attendu car nous avons tiré aléatoirement nos background dans
+toute la zone d'étude et donc ils ont pu tomber dans les mêmes cellules que des 
+points de présence. Pas d'inquiétudes, c'est ce que l'on avait prévu.
+
+On va pouvoir désormais préparer la calibration des modèles, en les paramétrant
+de manière correcte. Ce qui est important de savoir ici c'est que nos modèles
+vont avoir deux grosses difficultés statistiques :
+
+ - *déséquilibre des classes* : il y a au total
+  `r length(which(occurrences == 1))` présences et 
+  `r length(which(occurrences == 0))` backgrounds (qui seront
+ considérés comme des valeurs de 0 par les modèles), ce qui crée un gros 
+ déséquilibre entre les 1 et les 0. C'est ce que l'on appelle le déséquilibre
+ des classes.
+ 
+ - *chevauchement des classes* : il est probable que les présences et les
+ backgrounds se chevauchent sur les gradients de variables environnementales
+ (d'autant plus que nous pouvons avoir parfois une présence et un background
+ dans le même pixel), ce qui rend la distinction entre les 1 et les 0 difficile
+pour les modèles. C'est ce que l'on appelle le chevauchement des classes.
+ 
+La solution pour bien paramétrer les modèles face au déséquilibre et au
+chevauchement varie selon les modèles, mais le principe général est de réduire
+l'importance des backgrounds lors de la calibration par rapport au présence,
+afin de viser un ratio équilibre 50/50 entre importance des présences et 
+importance des backgrounds. Par exemple, on va attribuer des poids
+aux présences et aux backgrounds de sorte que la somme du poids des présences
+et des backgrounds soit égale. Cependant, cette méthode fonctionne mal sur 
+certains modèles comme le random forest, et il faut alors le paramétrer de 
+manière plus fine avec un rééchantillonnage à 50/50 en interne. 
+
+Par ailleurs, il est important de noter que l'évaluation des modèles avec la
+validation croisée n'est pas un élément validant la robustesse du modèle. Elle
+est plutôt à considérer comme un élément qui élimine les mauvais modèles, mais
+elle ne constitue pas une preuve de robustesse quand elle est bonne, car elle
+est limitée à la fois par la nature des données (présence-seule, pas 
+d'absences), et par la possibilité qu'il y ait des biais dans 
+l'échantillonnage. Ainsi, il est difficile d'utiliser la validation croisée
+pour identifier les meilleurs modèles ; il vaut mieux donc se baser sur des 
+paramètres établis pour être robustes en situation de présence-seule (e.g.,
+Valavi et al. 2021).
+ 
+Préparons donc la calibration de nos modèles :
+
+
+ 
+```{r warning=FALSE,message=FALSE}
+calib_summary <- 
+  summary(run_data, calib.lines =  table_cv) %>% 
+  filter(dataset == "calibration")
+
+iwp <- (10^6)^(1 - occurrences)
+
+
+RF_param_list <- NULL
+GLM_param_list <- NULL
+GBM_param_list <- NULL
+XGBOOST_param_list <- NULL
+XGBOOST_param_list <- NULL
+GAM_param_list <- NULL
+MARS_param_list <- NULL
+XGBOOST_param_list <- NULL
+for (cvrun in 1:nrow(calib_summary)) {
+  
+  prNum <- calib_summary$Presences[cvrun]
+  bgNum <- calib_summary$True_Absences[cvrun]
+
+  wt <- ifelse(occurrences == 1, 1, prNum / bgNum)
+
+  RF_param_list[[paste0("_",
+                        calib_summary$PA[[cvrun]],
+                        "_",
+                        calib_summary$run[[cvrun]])]] <-
+    list(ntree = 1000,
+         sampsize =  c("0" = prNum,
+                       "1" = prNum),
+         replace = TRUE)
+  
+  GLM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-
+    list(weights = wt)
+  
+  
+  GBM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-
+    list(interaction.depth = 5,
+         n.trees = 5000, 
+         shrinkage = 0.001,
+         bag.fraction = 0.75,
+         cv.folds = 5,
+         weights = wt)
+  
+  GAM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-     
+    list(weights = wt)
+  
+  MARS_param_list[[paste0("_",
+                          calib_summary$PA[[cvrun]],
+                          "_",
+                          calib_summary$run[[cvrun]])]] <- 
+    list(weights = wt)
+  
+  XGBOOST_param_list[[paste0("_",
+                             calib_summary$PA[[cvrun]],
+                             "_",
+                             calib_summary$run[[cvrun]])]] <-
+    list(nrounds = 10000,
+         eta = 0.001,
+         max_depth = 5,
+         subsample = 0.75,
+         gamma = 0,
+         colsample_bytree = 0.8,
+         min_child_weight = 1,
+         weight = wt,
+         verbose = 0)
+}
+
+model_parameters <- bm_ModelingOptions(
+  data.type = "binary",
+  models = c("RF", "GLM", "GBM", "GAM.mgcv.gam", "MARS", "MAXNET", "XGBOOST"),
+  strategy = "user.defined",
+  user.base = "default",
+  user.val = list(
+    GLM.binary.stats.glm = GLM_param_list,
+    GBM.binary.gbm.gbm = GBM_param_list,
+    GAM.binary.mgcv.gam = GAM_param_list,
+    MARS.binary.earth.earth = MARS_param_list,
+    RF.binary.randomForest.randomForest = RF_param_list,
+    XGBOOST.binary.xgboost.xgboost = XGBOOST_param_list
+  ),
+  bm.format = run_data,
+  calib.lines = table_cv
+)
+
+
+
+```
+
+L'étape précédente sert à définir des paramètres appropriés pour tous les 
+modèles ; cependant, nous n'allons pas utiliser tous les modèles. Nous allons
+maintenant sélectionner les modèles qui seront effectivement lancés. Ce choix
+est basé sur les modèles préliminaires complétés par des tests additionnels
+qui ont mis en évidence les modèles 
+donnant des résultats cohérents, par rapport aux modèles ne donnant pas des
+résultats cohérents :
+
+ - les modèles GLM, MARS et MAXNET donnaient des réponses biologiquement
+ irréalistes en U
+ 
+ - les modèles GBM et XGBOOST donnaient des réponses très chaotiques avec
+ de nombreux pics et creux, suggérant un effet de surajustement
+ 
+ - le modèle GAM accordait une importance réduite à la couche géologique des
+ serpentinites, contrairement à nos attentes, et avait de mauvaises évaluations
+ de son pouvoir prédictif (faible indice de Boyce)
+ 
+Au final, seul le modèles RF donnait à la fois des réponses cohérentes et des
+performances prédictives correctes. Ainsi, seul ce modèle sera utilisé pour les
+prédictions finales. 
+
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+model_list <- c("RF")
+```
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+model_runs <- BIOMOD_Modeling(
+  run_data,
+  modeling.id = "1", # ID de modélisation, on met 1 pour tous nos modèles ici
+  models = model_list,
+  OPT.strategy = "user.defined",
+  OPT.user = model_parameters, # Paramètres des modèles
+  CV.strategy = "user.defined", # Méthode de validation croisée
+  CV.user.table = table_cv, # Plis générés précéemment
+  CV.do.full.models = FALSE,
+  var.import = 10, # Nombre de répétitions d'importance des variables
+  metric.eval = "BOYCE",
+  do.progress = FALSE,
+  nb.cpu = 16 # Nombre de coeurs à utiliser pour la modélisation
+  # A ajuster selon votre ordinateur, ne pas en mettre trop !
+)
+saveRDS(model_runs, file = "models/serpentinites/model_runs.RDS")
+```
+
+
+# Evaluation des modèles
+
+```{r}
+evals_boyce <- get_evaluations(model_runs)
+ggplot(evals_boyce, aes(x = algo, y = validation)) +
+  geom_point(aes(col = run)) +
+  xlab("Algorithme") +
+  ylab("Indice de Boyce") +
+  labs(col = "Plis de\nvalidation\ncroisée") +
+  ylim(0, 1) +
+  theme_minimal()
+```
+
+L'indice de Boyce est un indice qui varie entre -1 et 1 (-1 = prédictions
+opposées à la réalité, 0 = prédiction nulles, 1 = prédictions parfaites). Ici,
+l'indice suggère des évaluations correctes pour tous les 
+modèles, même si elles ne sont pas toutes très élevées.
+
+Il faut néamoins toujours être prudent sur l'interprétation des métriques 
+d'évaluation car il s'agit de modèles corrélatifs et parce que l'évaluation est
+effectuée sur les données d'occurrence qui peuvent être biaisées. Ces métriques
+nous indiquent principalement qu'aucun modèle n'a donné de très mauvais 
+résultats, c'est l'information à en retirer. En revanche, il faut se garder
+de la fausse impression de robustesse que peuvent donner de bonnes métriques,
+car les modèles peuvent faire de bonnes prédictions avec des variables qui
+n'ont pas de sens pour la biologie des espèces. La prochaine étape consiste 
+donc à étudier les réponses des espèces aux variables environnementales.
+
+
+# Importance des variables et courbes de réponse
+
+```{r}
+varimp <- get_variables_importance(model_runs)
+
+varimp$expl.var <- reorder(varimp$expl.var,
+                           varimp$var.imp,
+                           median,
+                           na.rm = TRUE)
+
+library(dplyr)
+
+varimp %>%
+  group_by(expl.var) %>%
+  summarise(median = median(var.imp))
+
+ggplot(varimp) + 
+  geom_boxplot(aes(x = expl.var, y = var.imp)) +
+  geom_jitter(aes(x = expl.var, y = var.imp, col = algo),
+              alpha = .3) +
+  coord_flip() +
+  theme_minimal() +
+  xlab("Variable prédictive") +
+  ylab("Importance des variables") +
+  labs(col = "Algorithme")
+
+```
+
+
+```{r, fig.height = 6, fig.width = 8, warning = FALSE}
+# Variables utilisées pour la calibration
+cur_vars <- model_runs@expl.var.names
+
+# Calcul des courbes de réponse
+resp <- bm_PlotResponseCurves(bm.out = model_runs,
+                              fixed.var = "mean",
+                              data_species = occurrences,
+                              do.plot = FALSE,
+                              do.progress = FALSE)$tab
+
+colnames(resp) <- c("Index", "Variable", "Var.value", "Model", "Response")
+
+for (model in model_list) {
+											 
+  p <- ggplot(resp[grep(model, resp$Model), ], aes(x = Var.value, y = Response)) + 
+    geom_line(alpha = .5, aes(group = Model)) + 
+    stat_smooth() +
+    facet_wrap(~ Variable, scales = "free_x") + 
+    theme_bw() + 
+    ylim(0, 1.1) + 
+    xlab("Valeurs des variables") +
+    ylab("Réponse") +
+    ggtitle(model)
+  
+  print(p)
+}
+
+
+```
+
+*Note: la courbe bleue est une aide pour visualiser la tendance, mais la vraie réponse des modèles correspond aux courbes grises*
+
+
+Le facteur le plus déterminant pour l’habitat des plantes de serpentinites est, comme attendu, la couche géologique des serpentinites, avec un effet très marqué sur l’indice de favorabilité. Quand le recouvrement de serpentinites est de 0%, l’indice est très faible, tandis que dès qu’il existe un recouvrement même très faible, l’indice devient immédiatement élevé, avec un effet de plateau qui augmente légèrement quand la proportion de serpentinites augmente. 
+
+Ensuite, les facteurs climatiques et notamment l’humidité disponible jouent un rôle prépondérant : les espèces préfèrent des zones qui ne sont pas trop humides lors du mois excédentaire en précipitations (optimum plutôt bas sur le gradient cmi_max), mais ces zones ne doivent pas non plus être trop sèches durant le moins déficitaire en précipitations (optimum plutôt haut sur le gradient cmi_min). Ces résultats sont cohérents pour les espèces du groupe, qui sont réputées être plutôt des espèces de milieux assez secs, mais suggérant néanmoins une sensibilité en cas de sécheresse extrême. 
+
+Le degré de perturbation, à travers la variable d’intégrité biophysique des sols, semble avoir un effet sur ce groupe, les espèces préférant les zones faiblement perturbées, comme attendu dans nos hypothèses. Cet effet suggère une sensibilité particulière de ce groupe aux perturbations, ce qui est important à prendre en compte dans les actions PNA.
+
+Enfin, les modèles ont détecté un léger effet positif de l’exposition au rayonnement solaire sur la favorabilité, les espèces préférant les zones plutôt bien exposées. 
+
+
+# Cartes
+
+```{r, fig.width = 6, fig.height = 3, message=FALSE, warning=FALSE, results='hide'}
+# On ne va garder que les modèles qui ont un indice de Boyce suffisamment élevé
+models_to_proj <- evals_boyce$full.name[which(evals_boyce$validation >= 0.75)]
+
+
+projection_runs <- BIOMOD_Projection(
+  bm.mod = model_runs, # Modèles calibrés
+  proj.name = "corse", # Nom de la projection actuelle
+  new.env = env_serpentinites, # Données environnementales sur lesquelles on projette les modèles
+  models.chosen = models_to_proj, # Modèles à projeter
+  build.clamping.mask = TRUE, # Le clamping mask illustre les zones où les prédictions sont en dehors des valeurs
+  # utilisées lors de la calibration
+  nb.cpu = 4)
+
+cartes_individuelles <- rast("models/serpentinites/proj_corse/proj_corse_serpentinites.tif")
+
+
+# Rescaling des projections qui dépassent l'intervalle 0 - 1000
+cartes_individuelles[cartes_individuelles < 0] <- 0
+cartes_individuelles[cartes_individuelles > 1000] <- 1000
+
+for(i in 1:ceiling(nlyr(cartes_individuelles) / 2)) {
+  plot(cartes_individuelles[[(i * 2 - 1):
+                               min(nlyr(cartes_individuelles),
+                                   (i * 2))]], 
+       col = viridis::inferno(12))
+}
+
+
+```
+
+Les cartes individuelles des différents runs sont relativement convergentes
+dans leurs prédictions, avec quelques variations dans les zones à favorabilité
+intermédiaire. En particulier, on noteque selon les runs, certaines cartes 
+indiquent une large zone de favorabilité intermédiaire, contrairement aux autres
+runs.
+
+De manière intéressante, on note que les modèles qui ont un plus faible pouvoir
+prédicteur sont ceux qui ne prédisent pas de larges zones à favorabilité 
+intermédiaire.
+Il est probable que ces résultats soient dus à certaines occurrences localisées
+dans des zones à faible recouvrement de serpentinites. Quand ces occurrences 
+ne servent pas à la calibration à cause de la répartion des plis de validation
+croisée, alors les modèles ne prédisent pas de favorabilité intermédiaire pour 
+les zones à faible recouvrement de serpentinites. Ces modèles sont alors moins
+bien évalués, car les occurrences qui n'ont pas servi à la calibration servent
+à l'évaluation.
+
+Cet effet est donc dû à la résolution relativement grossière de l'analyse (1km²)
+qui crée de l'incertitude sur les zones à faible recouvrement de substrat de
+serpentinites.
+
+
+# Carte finale
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_finale <- mean(cartes_individuelles)
+ggplot() +
+  geom_spatraster(data = carte_finale) +
+  scale_fill_viridis(option = "inferno") +
+  geom_point(data =  P_points[which(P_points$occurrence == 1), ],
+             aes(x = x, y = y),
+             shape = 21,
+             fill = "#21908CFF",
+             col = "white",
+             size = 1) +
+  ggtitle("Indice de favorabilité final") +
+  xlab("Longitude") + 
+  ylab("Latitude") +
+  theme_minimal()
+```
+
+
+La carte finale semble cohérente avec les attendus sur la répartition de la végétation des serpentinites. Les zones à forte favorabilité (indice supérieur à 600) reflètent largement le substrat géologique, avec des nuances au sein de ces zones qui sont dues aux effets des autres variables (humidité, perturbations, exposition solaire). On note malgré tout deux points particuliers : d’une part, une distribution agrégée des occurrences vers les zones à favorabilité maximale, ce qui suggère que les espèces sont essentiellement observées dans les zones où plusieurs variables sont favorables à cette végétation. D’autre part, on note certains points dans des zones à faible favorabilité, ce qui peut soit refléter des occurrences accidentelles, soit la présence très localisée de zones à serpentinites qui ne sont pas représentées dans nos variables environnementales agrégées à la résolution de 1km².
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_incertitude <- app(cartes_individuelles, sd)
+ggplot() +
+  geom_spatraster(data = carte_incertitude) +
+  scale_fill_continuous(type = "viridis") +
+  ggtitle("Incertitude\n(écart-type des probabilités)") +
+  theme_minimal()
+```
+
+
+
+Comme pour la plupart des groupes, on observe de l’incertitude dans les zones à favorabilité intermédiaire, ce qui est fréquent pour ce type de modèles, en particulier quand la quantité de données est limitée, ce qui crée de la variation entre les plis de calibration. On note également quelques points à très forte incertitude (pointe nord du cap Corse, point littoral à l’Ouest de la Corse). Ces points reflètent des occurrences dans des conditions originales et distinctes des autres occurrences, ce qui crée des désaccords entre modèles suivant l’inclusion ou l’exclusion de ces points dans les plis de calibration. On peut supposer que ces occurrences reflètent des zones aux conditions environnementales mal représentées dans nos variables à notre résolution de travail(e.g., serpentinites très localisée et/ou mal répertoriées ; effet micro-climatique non représentatif à 1km²). Néanmoins, ces observations peuvent également représenter des conditions favorables mais mal représentées dans les modèles par manque d’occurrences. Il serait intéressant de faire une vérification terrain sur ces points pour évaluer quelle hypothèse est à privilégier.
+
+
+## Carte de potentiel d'habitat
+
+
+Pour créer la carte de potentiel d'habitat final, nous allons représenter 
+trois catégories de potentiel d'habitat, en respectant les contraintes 
+d'interprétation sur les modèles en présence seule. En effet, les modèles en
+présence seule ne peuvent pas fournir d'information sur la probabilité de
+présence. Par conséquent, ils ne peuvent informer sur les habitats défavorables 
+- ils informent seulement sur les habitats favorables compte-tenu des 
+connaissances actuelles.
+
+Ainsi, nous ne produirons pas de carte binaire "présence-absence" qui n'aurait
+pas de sens dans le cadre des modèles en présence-seule et qui est également une
+sur-simplification de la réalité biologique, qui n'est jamais binaire.
+Nous allons plutôt
+représenter trois catégories : 
+
+ - les zones à fort potentiel d'habitat
+ - les zones à potentiel d'habitat intermédiaire 
+ - les zones à potentiel d'habitat faible ou méconnu
+ 
+Pour établir une méthode permettant de définir ces trois catégories, on peut
+étudier comment les occurrences sont réparties sur le gradient de favorabilité
+des modèles. On peut alors utiliser les quantiles des occurrences pour 
+identifier les seuils séparant les catégories.
+
+
+```{r, fig.width = 6, fig.height = 2, message = FALSE}
+favorabilite_presences <- extract(carte_finale,
+                                  P_points[which(P_points$occurrence == 1),
+                                           c("x", "y")],
+                                  ID = FALSE)
+
+qt_favorabilite <- quantile(favorabilite_presences$mean, probs = c(.05, .25))
+
+
+ggplot(favorabilite_presences) +
+  geom_boxplot(aes(x = mean),
+               col = "darkgrey") +
+  geom_vline(xintercept = qt_favorabilite,
+             col = c("#1b9e77", "#7570b3"),
+             linetype = 2,
+             linewidth = 2) +
+  theme_minimal() +
+  xlab("Indice de favorabilité") +
+  scale_y_continuous(breaks = 0,
+                     labels = "Occurrences") +
+  xlim(0, 1000)
+```
+
+Dans le graphe ci-dessus, on voit la répartition des occurrences sur l'indice
+de favorabilité produit par le modèle. On peut utiliser les quantiles à 5% et 
+25% (représentés par les pointillés bleus) pour séparer les catégories. 
+
+ - La zone à droite du quantile à 25% (le trait mauve) contient l'essentiel des 
+ occurrences du groupe d'espèces, ce qui signifie qu'au delà de ce seuil, 
+ le **potentiel d'habitat est élevé**. 
+
+ - La zone entre le quantile à 5% (trait vert) et à 25% (trait mauve) est une
+ zone à favorabilité plus faible mais qui contient tout de même 20% des 
+ occurrences du groupe. On peut ainsi la caractériser comme **zone à potentiel
+ d'habitat intermédiaire**. 
+ 
+ - La zone à gauche du quantile à 5% (trait vert) contient moins de 5% des
+ occurrences du groupe. Il s'agit donc de valeurs de favorabilité plutôt faibles
+ puisqu'elles ne semblent pas ou peu occupées d'après les connaissances 
+ actuelles. On peut donc qualifier cette catégorie de **potentiel d'habitat 
+ faible ou méconnu**.
+ 
+ Si l'on utilise ces seuils pour illustrer la répartition de ces trois 
+ catégories, on obtient la carte suivante :
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_indice <- carte_finale
+carte_indice[carte_finale < qt_favorabilite["5%"]] <- 0
+carte_indice[carte_finale >= qt_favorabilite["5%"] &
+               carte_finale < qt_favorabilite["25%"]] <- 1
+carte_indice[carte_finale >= qt_favorabilite["25%"]] <- 2
+
+carte_indice <- as.factor(carte_indice)
+
+
+ggplot() + 
+  geom_spatraster(data = carte_indice) +
+  scale_fill_manual(values = viridis::plasma(3),
+                    name = paste0("Potentiel d'habitat\n(% du total ",
+                                  "d'occurrences\n",
+                                  "observé dans cette classe\n",
+                                  "de favorabilité)"),
+                    labels = c("Faible ou méconnu (< 5%)",
+                               "Intermédiaire (5-25%)",
+                               "Elevé (75%)"),
+                    na.translate = F)
+
+```
+
+La carte de potentiel d’habitat illustre que la zone qui présente le potentiel d’habitat le plus élevée – couvrant 75% des observations connues pour ce groupe – est assez restreinte, illustrant que les zones réellement favorables nécessitent la combinaison des effets positifs de plusieurs variables : couche géologique des serpentinites et conditions climatiques et de perturbation favorables. Cette répartition restreinte est cohérente avec les observations connues pour ce groupe. Les zones à potentiel d’habitat intermédiaire – correspondant à des indices de favorabilité plus faible mais comprenant tout de même 20% des observations connues de ce groupe – sont également limitées à quelques zones en périphérie des zones à fort potentiel d’habitat, en particulier au sud de la zone à serpentinites.
+
+# Sauvegarde des cartes en fichiers SIG
+
+```{r}
+writeRaster(carte_finale,
+            "outputs/carte_serpentinites_indicemoy.tif", overwrite = TRUE)
+writeRaster(carte_incertitude,
+            "outputs/carte_serpentinites_incertitude.tif", overwrite = TRUE)
+writeRaster(carte_indice,
+            "outputs/carte_serpentinites_potentielhabitat.tif", overwrite = TRUE)
+
+```

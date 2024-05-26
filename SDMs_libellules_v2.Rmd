@@ -1,0 +1,1129 @@
+---
+title: "Libellules"
+author: "Boris Leroy"
+date: "`r format(Sys.time(), '%d/%m/%y')`"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    toc: yes
+    df_print: paged
+---
+### *Note sur ce gabarit Rmarkdown*
+
+Copyright Boris Leroy, `r format(Sys.time(), '%y')`
+
+leroy.boris@gmail.com
+
+Ce fichier constitue un gabarit complet pour la modélisation des habitats 
+potentiels d'une espèce ou d'un groupe d'espèce. [**Il est fourni sous licence 
+libre CeCILL-C**.](https://cecill.info/licences.fr.html)
+
+
+Ce fichier est régi par la licence CeCILL-C soumise au droit français et
+respectant les principes de diffusion des logiciels libres. Vous pouvez
+utiliser, modifier et/ou redistribuer ce programme sous les conditions
+de la licence CeCILL-C telle que diffusée par le CEA, le CNRS et l'INRIA 
+sur le site "http://www.cecill.info".
+
+En contrepartie de l'accessibilité au code source et des droits de copie,
+de modification et de redistribution accordés par cette licence, il n'est
+offert aux utilisateurs qu'une garantie limitée.  Pour les mêmes raisons,
+seule une responsabilité restreinte pèse sur l'auteur du programme,  le
+titulaire des droits patrimoniaux et les concédants successifs.
+
+*La licence CeCILL-C implique une obligation de citation et de diffusion du code
+sous licence libre en cas de réutilisation.*
+
+Citation recommandée :
+**Leroy B**. 2024. Modélisation de l'habitat des groupes d'espèces sujettes aux
+plans nationaux d'action. Code source disponible sur https://www.borisleroy.com/sdms-pna-corse
+
+
+
+Il a été testé fonctionnel sur la version de R `r R.version.string`, avec les packages
+sf (`r packageVersion("sf")`), terra (`r packageVersion("terra")`), ggplot2 
+(`r packageVersion("ggplot2")`), scales (`r packageVersion("scales")`), egg 
+(`r packageVersion("egg")`), virtualspecies 
+(`r packageVersion("virtualspecies")`), blockCV 
+(`r packageVersion("blockCV")`), biomod2 (`r packageVersion("biomod2")`),
+dplyr (`r packageVersion("dplyr")`), tidyterra (`r packageVersion("tidyterra")`), viridis 
+(`r packageVersion("viridis")`). 
+
+Il est possible que des évolutions futures de packages (notamment, biomod2, qui 
+est sujet à de nombreuses évolutions en 2023 et 2024) rendent certaines parties
+du fichier non fonctionnelles, ce qui nécessitera de corriger le code.
+
+
+
+# Pré-requis :
+
+Chargement des packages et fonctions, chargement de données géographiques et
+des variables environnementales harmonisées
+
+```{r message=FALSE, warning=FALSE}
+library(sf)
+library(terra)
+library(ggplot2)
+library(scales)
+library(egg)
+library(virtualspecies)
+library(blockCV)
+library(biomod2)
+library(dplyr)
+library(tidyterra)
+library(viridis)
+source("scripts/functions.R")
+
+# Shapefile de la Corse
+corse <- st_read("data/corse.gpkg")
+# Données environnementales harmonisées
+env_corse <- rast("data/env_corse_total_sync.tif")
+```
+
+# Chargement et préparation des données d'occurrence
+
+```{r fig.height=3, fig.width=6, message=FALSE, warning=FALSE}
+libellules <- st_read("data/donnees_brutes/taxa/libellules.shp")
+libellules$species <- simplify_species_name(libellules$nom_valide)
+
+libellules <- libellules[, c("species", "x_centroid", "y_centroid",
+                             "date_fin")]
+colnames(libellules) <- c("species", "x", "y", "date", "geometry")
+
+# Dates d'échantillonnage
+libellules$year <- as.numeric(strtrim(libellules$date, 4))
+libellules$month <- as.numeric(substr(libellules$date, 6, 7))
+
+
+libellulescsv <- read.csv("data/donnees_brutes/taxa/records-2023-07-21_libellules.csv")
+
+# Données spatialement imprécises à retirer : nombre de points
+length(which(libellulescsv$precisionGeometrieMetres > 1000))
+
+libellulescsv <- libellulescsv[
+  -which(libellulescsv$precisionGeometrieMetres > 1000), ]
+
+# Elimination des occurrences trop imprécises
+libellulescsv <- libellulescsv[
+  -which(libellulescsv$precisionLocalisation %in% 
+           c("XY centroïde commune",
+             "XY centroïde ligne/polygone",
+             "pas de XY (département)")), ]
+
+libellulescsv <- st_as_sf(libellulescsv,
+                          wkt = "objetGeoWKT") # libellulescsv contient les 
+# coordonnées au format WKT dans la colonne "objetGeoWKT"
+libellulescsv <- libellulescsv[, c("nomScientifiqueRef", "longitude",
+                                   "latitude", "dateObservation", "annee", 
+                                   "mois")]
+# On renomme les colonnes 
+colnames(libellulescsv) <- c("species", "x", "y", "date", "year", 
+                             "month", "geometry")
+# On indique à sf quelle colonne renommée contient les coordonnées
+st_geometry(libellulescsv) <- "geometry"
+
+# On définit le système de coordonnées pour libellulescsv
+st_crs(libellulescsv) <- "EPSG:4326"
+
+libellules <- rbind(libellules[, c("species", "x", "y", "date", "year", 
+                             "month", "geometry")],
+                    libellulescsv)
+
+
+# Exclusion des libellules qui occupent des habitats différents
+libellules <- libellules[which(!(libellules$species %in%
+                                   c("Enallagma cyathigerum",
+                                     "Paragomphus genei"))), ]
+
+# Visualisation de la temporalité des occurrences
+ggplot(libellules) +
+  geom_boxplot(aes(x = species,
+                   y = year))+ 
+  coord_flip() +
+  scale_y_continuous(breaks = breaks_pretty()) +
+  theme_minimal()
+```
+
+## Filtre temporel
+
+Il faut établir un filtre temporel pour éliminer les données imprécises, 
+sachant que l'objectif est de modéliser à une résolution assez fine, de l'ordre
+de 1km.
+Le champ `precision` est peu renseigné et donc peu utile ici, il nous faut donc
+poser une hypothèse sur les données qui sont imprécises. On peut considérer que
+les GPS ont commencé à être largement disponibles à partir de 1990, mais leur
+utilisation ne s'est généralisée qu'à partir des années 2000, notamment grâce
+à leur miniaturisation. Ainsi, on peut spéculer qu'avant les années 2000, les
+données étaient moins précisés car possiblement géolocalisées en utilisant des
+référentiels comme les lieu-dits ou les communes, tandis qu'à partir des années
+2000 la précision s'est améliorée grâce à la géolocalisation par satellite. Pour
+le cas spécifique des odonates, l'année 1999 contient 7% des données, et donc le
+seuil sera placé à 1999 comme compromis permettant de conserver beaucoup de 
+données.
+
+Le nombre de données supprimées en fixant un seuil à l'année 1999 est 
+limité :
+
+```{r fig.height=10, fig.width=6}
+# Les données avant 2000 représentent un % modéré du jeu de données : 
+100 * length(which(libellules$year < 1999)) / nrow(libellules)
+```
+
+La couverture temporelle sur l'année est faible pour toutes les années :
+
+```{r fig.height=10, fig.width=10}
+ggplot(libellules) +
+  geom_boxplot(aes(x = species,
+                   y = month)) +
+  facet_wrap(~year) + 
+  coord_flip() +
+  scale_y_continuous(breaks = breaks_pretty()) +
+  theme_minimal()
+```
+
+L'emprise spatiale des données d'occurrence change de manière modérée
+avec ou sans les données pré-1999 :
+
+```{r fig.height=7, fig.width=10}
+
+p_libellules_all <- ggplot() +
+  geom_sf(data = corse) +
+  geom_sf(data = libellules, aes(col = year)) +
+  scale_color_continuous(type = "viridis") + 
+  theme_minimal(base_size = 15) +
+  ggtitle("Toutes données\nlibellules")
+
+p_libellules_post1999 <- ggplot() +
+  geom_sf(data = corse) +
+  geom_sf(data = libellules[libellules$year >= 1999, ], aes(col = year)) +
+  scale_color_continuous(type = "viridis") + 
+  theme_minimal(base_size = 15) +
+  ggtitle("Données post-1999\nlibellules")
+
+ggarrange(p_libellules_all,
+          p_libellules_post1999,
+          nrow = 1)
+```
+
+On pose donc l'hypothèse raisonnable qu'un filtre à 1999 va assurer une bonne 
+précision dans la localisation des occurrences sans perdre d'information
+critique sur la répartition des espèces.
+
+```{r}
+libellules <- libellules[which(libellules$year >= 1999), ]
+```
+
+## Rasterisation des occurrences
+
+L'objectif ici est de ne garder qu'une occurrence par cellule à la résolution 
+de nos variables environnementales afin d'éviter une forme extrême de
+pseudo-réplication.  Par exemple, si dans une cellule donnée on a initialement
+30 observations de la même espèce, alors, après rasterisation, ces 30 
+observations ne compteront que comme une seule occurrence. Cette étape est
+indispensable car elle évite de donner aux modèles, par exemple, 30 fois la même
+valeur de température provenant d'une seule cellule. C'est ce qu'on appelle
+de la pseudo-réplication et c'est très problématique pour les domaines. 
+On s'attend donc à ce que cette étape réduise le nombre d'occurrences pour les
+modèles.
+
+```{r}
+# On rasterise les occurrences à la résolution de nos variables 
+# environnementales
+libellules_r <- rasterize(libellules, 
+                             env_corse)
+names(libellules_r) <- "libellules" # Attention il ne faut pas nommer
+# la couche "libellules" car il y a des variables qui s'appellent 
+# libellules
+
+plot(libellules_r)
+```
+
+
+On va ensuite éliminer les occurrences qui sont dans des zones sans 
+valeurs de variables environnementales (i.e., essentiellement en zones
+côtières).
+Pour cela on va combiner les variables
+environnementales avec les occurrences rasterisées dans un `data.frame`, et 
+supprimer les occurrences d'espèces qui tombent sur des données 
+environnementales manquantes
+
+```{r}
+# On crée un stack avec nos occurrences rasterisées et les variables env
+env_libellules <- c(env_corse,
+                       libellules_r)
+
+# On récupère les coordonnées XY de toutes les cellules, pour préparer nos
+# données finales
+coorXY <- xyFromCell(env_corse, 
+                     1:ncell(env_corse))
+# On transforme le raster en data.frame 
+env_libellules_df <- values(env_libellules)
+
+env_libellules_df[is.nan(env_libellules_df)] <- NA
+
+# On regarde le nombre d'occurrences pour lesquelles il y a des données 
+# manquantes : 
+length(which(is.na(env_libellules_df[, "bio1"]) & 
+               !is.na(env_libellules_df[, "libellules"])))
+```
+
+On va maintenant supprimer les cellules pour lesquelles on n'a pas de données
+environnementales. Pour cela on va utiliser la première variable
+environnementale ici, car les données manquantes sont toutes les mêmes
+entre toutes les variables environnementales (cf. script harmonisation des
+données).
+
+
+```{r}
+# On filtre d'abord sur l'objet qui contient les coordonnées
+coorXY <- coorXY[-which(is.na(env_libellules_df[, 1])), ]
+# Et ensuite sur le tableau avec variables env et présences d'espèces
+env_libellules_df <- env_libellules_df[which(!is.na(env_libellules_df[, 1])), ]
+
+# Comparaison du nombre d'occurrences :
+# Avant rasterisation
+nrow(libellules)
+
+# Après rasterisation et élimination des données env manquantes
+length(which(env_libellules_df[, "libellules"] == 1))
+```
+
+Il s'agit donc du nombre d'occurrences que l'on va pouvoir utiliser pour 
+calibrer nos modèles. Il y a  
+`r length(which(env_libellules_df[, "libellules"] == 1))` 
+occurrences ce qui est assez élevé pour la calibration des modèles.
+
+On va maintenant formater ces occurrences en combinant
+coordonnées et info sur l'occurrence dans un `data.frame` pour préparer la
+calibration de nos modèles
+
+```{r}
+P_points <- data.frame(
+  # D'abord on récupère les coordonnées XY qui correspondent à nos cellules de présences
+  coorXY[which(!is.na(env_libellules_df[, "libellules"])), ],
+  # Ensuite, on récupère la colonne qui indique présence pour chaque cellule
+  occurrence = env_libellules_df[which(!is.na(env_libellules_df[, "libellules"])),
+                             "libellules"])
+
+P_points
+```
+
+
+# Génération des points de background
+
+Etant donné que nos observations sont des présences-seules, i.e. sans données
+d'absences, il nous faut générer des points de "background" pour pouvoir 
+calibrer les modèles. Ces points de backgrounds sont des données tirées dans
+toute la zone d'étude qui renseignent les modèles sur comment les variables
+environnementales sont distribuées dans la géographie. Ces points seront fournis
+aux modèles comme des 0, ce qui permettra aux modèles d'identifier quels 
+habitats apparaissent comme favorable parmi l'ensemble des habitats disponibles.
+Cependant, ces 0 ne sont pas interprétés comme des absences, et l'interprétation
+finale du modèle nécessitera des précautions particulières, comme par exemple
+ne pas considérer la valeur issue du modèle comme une "probabilité de présence" 
+; elle sera plutôt considérée comme un indice de favorabilité de l'habitat.
+
+La littérature statistique récente suggère que les meilleures pratiques 
+consistent à générer un grand nombre de points de background (e.g., 10000)
+indépendamment de la localisation des points de présence (i.e., un point de 
+background peut être localisé au même endroit qu'un point de présence). Cela
+permet d'assurer une bonne représentation de l'ensemble des conditions 
+environnementales disponibles dans le modèle. Dans le cas de la Corse, le 
+nombre de points de background sera limité par le nombre de pixels disponibles :
+
+```{r}
+# Nous avons éliminé les données manquantes du tableau env_amphib_df
+# Par conséquent, son nombre de lignes est égal au nombre total de pixels 
+# disponibles sur la Corse
+nrow(env_libellules_df)
+```
+
+Ainsi, nous fixerons le nombre de background par défaut à 10000 ce qui sera 
+suffisant pour
+une bonne calibration des modèles.
+Il n'est pas nécessaire de faire plusieurs répétitions, car le nombre de 
+points de background est déjà suffisamment élevé, les résultats de calibration
+ne varieraient pas entre différentes répétitions.
+
+Des tests préliminaires ont révélé que les données d'occurrence semblent 
+excessivement échantillonnées proches des routes, plus proches que si 
+l'échantillonnage avait lieu de manière aléatoire. Ainsi, nous allons
+corriger l'effet d'accessibilité lié à la distance aux routes en tirant
+les points de background avec un biais lié à la distance aux routes.
+
+
+```{r, fig.height = 7, fig.width = 5}
+prob_distance_routes <- env_corse[["distance_routes"]]
+# Utilisation d'une exponentielle inverse pour la probabilité d'échantillonnage
+prob_distance_routes <- 
+  exp(-(prob_distance_routes / global(prob_distance_routes,
+                                      "max", na.rm = T)[1, 1] + 1)^2)
+
+# On réduit également le nombre de background pour avoir un effet du biais
+background <- spatSample(prob_distance_routes,
+                         method = "weights",
+                         size = 6000,
+                         replace = FALSE, # Pas de remise
+                         na.rm = TRUE, # Pas dans les données manquantes
+                         xy = TRUE, # L'output inclut les coords XY
+                         values = FALSE) # L'output exclut les variables
+
+
+# On ajoute les points de background aux données de présence
+P_points <- rbind.data.frame(P_points,
+                             data.frame(background, 
+                                        occurrence = 0))
+
+```
+
+# Sélection des variables environnementales
+
+
+
+
+##  Climat
+
+La température est vraisemblablement la variable la plus importante affectant les processus écophysiologiques et l'activité des ectothermes, affectant notamment leur développement avec l'existence de seuils minimums en dessous desquels l'espèce ne peut se développer, et des seuils maximums causant la mortalité de l'espèce. La réponse typique des espèces à la température prend la forme d'une courbe asymétique avec une croissante progressive à partir du seuil minimum jusqu'à un optimum, et un un seuil critique supérieur rapidement atteint au delà de l'optimum (Suhling et al. 2015). La plupart des odonates requièrent un minimum de 8 à 12°C de température pour leur développement, ont un optimum entre 21 et 31°C, et une limite létale de 35 à 44°C (Suhling et al. 2015, Castillo-Pérez et al. 2022). Cependant, la limite létale supérieure est très rarement atteinte en pratique par les organismes, car les températures élevées limitent suffisamment de nombreux processus physiologiques clés pour exclure les espèces des régions avant que la chaleur n'entraîne leur mortalité (Evans et al. 2015).  Ainsi, il apparait justifié d'utiliser pour les odonates les températures minimum et maximum de l'année pour représenter les conditions favorables à la survie et au développement des odonates, avec l'hypothèse que nous observerons un effet positif de la température au dessus du seuil minimum indiqué ci-dessus, et négatif à partir d'un certain seuil de température élevé qui sera inférieur aux limites létales.
+
+L'humidité relative joue également probablement un rôle important pour éviter la dessication des organismes, en particulier aux fortes températures, même si la littérature semble lacunaire sur cet aspect pour les odonates. Nous explorerons l'effet de l'humidité relative minimale en supposant un effet négatif en particulier dans les zones sujettes aux températures élevées.
+
+
+Noms des variables retenues :
+
+ - températures les plus chaudes (*bio5*) et les plus froides de l'année (*bio6*)
+ 
+ - humidité relative minimale (*cmi_min*) 
+
+
+
+
+##  Occupation du sol
+
+Les libellules sont inféodés aux milieux aquatiques et aux zones humides, car leur larve se développe dans le milieu aquatique et la reproduction des adultes se déroule au niveau des milieux aquatiques. Il est ainsi attendu une relation positive très forte entre la présence de milieux aquatiques et zones humides et la probabilité d'observation des odonates, et que cette relation diminue avec la distance. 
+
+Les libellules sont réputées sensibles à l’intensification agricole, par un effet direct de l’usage des pesticides ou par un effet indirect dû à la réduction du nombre de proies ; par exemple, une relation négative a été démontrée entre diversité des odonates et intensification agricole (Goertzen & Suhling, 2019). Ainsi, nous explorerons l’effet de la densité de zones cultivées et de l’intensification (à travers le proxy de l’intégrité biophysique des sols, Guetté et al., 2021) avec l’hypothèse d’un effet négatif sur la probabilité d’observer les odonates. En parallèle, l’urbanisation - en créant des mosaïques d’habitats diversifiés - semble avoir un effet positif sur la diversité d’odonates, mais provoquant un changement dans la structure des communautés (Goertzen & Suhling, 2019). Il est difficile de spéculer sur l’effet de l’urbanisation sur l’ensemble des espèces présentées ici, aussi nous explorerons l’effet de cette variable sans a priori sur la possibilité d’un effet positif ou négatif.
+
+Noms des variables retenues :
+
+ - présence des zones humides (*milieux_eaudouce*)
+ 
+ - zones humides (*potentielles_zh*)
+ 
+ - distance aux zones humides (*dist_moy_pzh*)
+
+ - intensification agricole et artificialisation, en utilisant le proxy de l'intégrité biophysique des sols (*integrite*)
+
+
+##  Biais d'échantillonnage
+
+La probabilité d'observer les espèces est souvent directement liée à l'accessibilité du milieu, qui est connue pour être fortement corrélée à la distance aux routes. Nous utiliserons donc la distance aux routes comme proxy du biais d'échantillonnage afin d'éviter que les modèles ne cherchent à expliquer l'accessibilité par les autres variables environnementales.
+
+
+Noms des variables retenues :
+
+ - distance aux routes (*distance_routes*)
+
+
+
+##  Variables anthropogéniques
+
+La qualité de l'eau semble jouer un rôle important sur la survie et le développement des populations d'odonates. Néanmoins, il est difficile d'obtenir des variables environnementales spatialisées sur toute la zone d'étude indiquant la qualité de l'eau. Une solution alternative seraait de spéculer que la qualité de l'eau est inversement corrélée à la densité de population humaine, et donc utiliser la densité de population humaine comme variable distale reflétant non seulement la qualité de l'eau, mais également le degré de perturbation des milieux. Cependant, la densité de population humaine est très faible en Corse, ce qui rend l'utilisation de cette variable très incertain pour les modèles.
+
+Noms des variables retenues :
+
+ - Densité de population humaine *pop_dens_log10*
+
+##  Autres variables et commentaires
+
+Les odonates étant des organismes volant au stade adulte, ils est possible qu'ils soient affectés par les régimes de vent excessifs. Nous testerons donc s'il existe une relation négative entre la probabilité d'observer les odonates et les variables liées aux régimes de vent.
+
+Noms des variables retenues :
+
+ - Vitesse du vent mensualisée maximale sur l'année (*sfcWind_max*)
+
+
+## Constitution du jeu de variables finales pour les libellules
+
+### Préparation des rasters
+
+```{r}
+env_libellules <- env_corse[[c("bio5",
+                               "bio6",
+                               "cmi_min",
+                               "milieux_eaudouce",
+                               "potentielles_zh",
+                               "dist_moy_pzh",
+                               "integrite",
+                               "pop_dens_log10",
+                               "sfcWind_max")]]
+```
+
+
+### Etude de la colinéarité et réduction du nombre de variables
+
+La colinéarité est la corrélation qui existe entre les variables 
+environnementales. Des variables colinéaires posent des problèmes pour la
+calibration de nombreux modèles statistiques, donc on s'assure toujours 
+d'éliminer les variables colinéaires avant de faire la calibration.
+
+On étudie la colinéarité entre les variables avec le coefficient de corrélation
+de Spearman (car certaines variables ne sont pas distribuées normalement), en utilisant un seuil standard de 0.7. 
+
+```{r fig.height = 10, fig.width = 10}
+var_groups <- removeCollinearity(env_libellules,
+                                 plot = TRUE,
+                                 multicollinearity.cutoff = 0.7,
+                                 method = "spearman")
+```
+
+Seules deux variables sont corrélées fortement : le % de recouvrement  des zones
+humides dans chaque cellule et la distance aux zones humides. 
+Nous conserverons seulement le % de recouvrement  des zones
+humides qui reflète l'existence ou non de zones humides dans chaque cellule.
+
+```{r}
+env_libellules <- env_libellules[[-which(names(env_libellules) == 
+                                             "dist_moy_pzh")]]
+```
+
+Au total il y a 8 variables environnementales, pour environ 110 occurrences, 
+ce qui est acceptable. 
+
+
+
+### Filtrage des variables non informatives
+
+[Les analyses préliminaires](http://borisleroy.com/sdms_pna_corse/SDMs_amphibiens_v1.html) 
+ont révélé que la variable *milieux_eaudouce* n'a pas vraiment d'effet 
+détectable, et elle sera donc éliminée.
+La variable d'intégrité physique présente également une réponse difficile à 
+expliquer d'un point de vue biologique et sera donc supprimée.
+
+```{r}
+env_libellules <- env_corse[[c("bio5",
+                               "bio6",
+                               "cmi_min",
+                               "potentielles_zh",
+                               "pop_dens_log10",
+                               "sfcWind_max")]]
+```
+
+
+
+# Préparation de la stratégie de validation croisée des modèles
+
+Nous ne disposons pas de jeu de données indépendant pour évaluer les modèles.
+Par conséquent, il nous faut utiliser une procédure de "validation croisée" qui
+consiste à séparer le jeu de données en deux, une partie sert à la calibration
+des modèles, et l'autre partie sert à l'évaluation. L'approche classique 
+consiste à faire de découpage de manière aléatoire, mais il a été démontré qu'un
+découpage aléatoire est suroptimiste car les points de données de calibration
+sont très proches, spatialement, des points de données d'évaluation.
+
+Pour éviter ce problème de proximité spatiale, nous allons utiliser une
+procédure dite de "validation croisée spatiale par blocs". Cette validation 
+croisée par blocs vise à réduire l'autocorrélation spatiale entre jeu de données 
+de calibration et jeu de validation. L'autocorrélation spatiale est le fait que
+des points proches dans l'espace ont des valeurs de variables environnementales
+similaires. Eviter l'autocorrélation spatiale entre jeu de calibration et 
+d'évaluation revient à éviter que les valeurs de variables environnementales
+soient similaires entre calibration et évaluation - cela permet de mieux tester
+la réelle capacité des modèles à prédire l'habitat favorable aux espèces.
+
+
+La démarche de validation croisée par blocs est la suivante :
+
+1. Définir une taille de blocs qui réduit l'autocorrélation spatiale entre
+calibration et évaluation
+
+2. Répartir les blocs en plis ("folds") de calibration et d'évaluation
+
+3. Vérifier que les plis sont équilibrés, i.e. le nombre de points de 
+calibration doit être similaire entre les plis. Si les plis sont déséquilibrés,
+recommencer les étapes 1-3 en réduisant la taille des blocs. 
+
+Nous allons utiliser une procédure de validation croisée par bloc ce qui permet
+de réduire l'autocorrélation spatiale entre jeu de données de calibration et 
+jeu de validation. 
+
+## Définition de la taille des blocs
+
+Il faut étudier le degré d'autocorrélation spatiale dans les variables 
+environnementales pour avoir une idée de la taille des blocs. La taille des 
+blocs est un compromis entre l'objectif de diminution de l'autocorrélation 
+spatiale et les contraintes des données d'occurrences. En effet, si toutes
+les occurrences sont localisées dans une petite zone, il ne sera pas possible de
+viser des blocs trop grands, car on ne pourrait alors pas séparer les points en 
+jeu de calibration et jeu d'évaluation.
+
+
+```{r warning = FALSE}
+# Pour étudier la taille des blocs à viser, il faut d'abord projeter le raster
+# en mètres, sinon la fonction de calcul de l'autocorrélation échouera
+env_libellules_l93 <- project(env_libellules,
+                               "EPSG:2154") # Projection en Lambert 93 ici
+
+# Ensuite on étudie le range d'autocorrélation spatiale
+AC_range <- cv_spatial_autocor(env_libellules_l93,
+                               num_sample = 10000)
+```
+
+On obtient initialement un range médian qui est de 
+`r round(AC_range$range / 1000, 1)` km. Cependant, les données de libellules présentent une répartition aggrégée qui cause des déséquilibres dans
+les plis de validation croisée. Pour corriger ce problème nous réduirons la 
+taille des blocs à 5 km².
+
+```{r warning=FALSE}
+P_points_sf <- st_as_sf(P_points, 
+                        coords = c("x", "y"), 
+                        crs = "EPSG:4326")
+
+plis_cv <- cv_spatial(x = P_points_sf,
+                      column = "occurrence", # Nom de la colonne des occurrences
+                      k = 6, # Nombre de plis (folds) pour la k-fold CV
+                      size = 5000, # Taille des blocs en metres
+                      selection = "random", # Attribution des blocs aléatoire dans 
+                      # les plis
+                      iteration = 50, # Nombre d'essais pour trouver des plis
+                      # équilibrés
+                      biomod2 = TRUE, # Formater les données pour biomod2
+                      r = env_libellules, # Pour le fond de carte
+                      progress = FALSE,
+                      plot = FALSE) 
+
+```
+
+
+On voit que nos plis sont plutôt 
+`r ifelse(max((plis_cv$records$train_1 - median(plis_cv$records$train_1)) / median(plis_cv$records$train_1)) > 0.3, "déséquilibrés", "équilibrés")` :
+								  
+
+ - de `r min(plis_cv$records$train_1)` à `r max(plis_cv$records$train_1)` présences pour la calibration
+ 
+ - de `r min(plis_cv$records$test_1)` à `r max(plis_cv$records$test_1)` présences pour 
+l'évaluation
+
+On peut visualiser la répartition des points de calibration ("Train") et 
+évaluation ("Test") pour chaque pli sur la carte suivante : 
+
+```{r warning=FALSE,}
+cv_plot(plis_cv, x = P_points_sf)
+```
+
+Cette carte inclut à la fois les présences et les backgrounds.
+
+
+Dernière étape, biomod2 exige un format particulier pour les plis de validation
+croisée, donc on va préparer ce format ici :
+
+```{r}
+table_cv <- plis_cv$biomod_table
+colnames(table_cv) <- paste0("_allData_", 
+                             colnames(table_cv))
+```
+
+
+# Calibration des modèles
+
+Tout d'abord on prépare les données pour biomod2.
+
+```{r}
+coorxy <- P_points[, c("x", "y")]
+occurrences <- P_points[, "occurrence"]
+
+
+dir.create("models/libellules", recursive = T, showWarnings = FALSE)
+
+run_data <- BIOMOD_FormatingData(
+  resp.name = "libellules", # Nom de l'espèce
+  resp.var = occurrences, # Présences + background
+  expl.var = env_libellules, # Variables environnementales prédictives
+  dir.name = "models", # Dossier dans lequel on va stocker les modèles
+  resp.xy = coorxy, # Coordonnées xy des présences et background
+  PA.strategy = NULL) # Pas de génération de points de background par biomod
+# Car on en a généré nous-mêmes
+
+saveRDS(run_data, file = paste0("models/libellules/run_data.RDS"))
+```
+Biomod nous indique deux choses : que nous n'avons pas de données indépendantes
+pour l'évaluation, ce qui est effectivement le cas à ce stade de l'étude.
+Par ailleurs, que plusieurs données peuvent être dans la même cellule, ce qui 
+est également attendu car nous avons tiré aléatoirement nos background dans
+toute la zone d'étude et donc ils ont pu tomber dans les mêmes cellules que des 
+points de présence. Pas d'inquiétudes, c'est ce que l'on avait prévu.
+
+On va pouvoir désormais préparer la calibration des modèles, en les paramétrant
+de manière correcte. Ce qui est important de savoir ici c'est que nos modèles
+vont avoir deux grosses difficultés statistiques :
+
+
+ - *déséquilibre des classes* : il y a au total
+ `r length(which(occurrences == 1))` présences et 
+  `r length(which(occurrences == 0))` backgrounds (qui seront
+ considérés comme des valeurs de 0 par les modèles), ce qui crée un gros 
+ déséquilibre entre les 1 et les 0. C'est ce que l'on appelle le déséquilibre
+ des classes.
+ 
+ - *chevauchement des classes* : il est probable que les présences et les
+ backgrounds se chevauchent sur les gradients de variables environnementales
+ (d'autant plus que nous pouvons avoir parfois une présence et un background
+ dans le même pixel), ce qui rend la distinction entre les 1 et les 0 difficile
+ pour les modèles. C'est ce que l'on appelle le chevauchement des classes.
+ 
+La solution pour bien paramétrer les modèles face au déséquilibre et au
+chevauchement varie selon les modèles, mais le principe général est de réduire
+l'importance des backgrounds lors de la calibration par rapport au présence,
+afin de viser un ratio équilibre 50/50 entre importance des présences et 
+importance des backgrounds. Par exemple, on va attribuer des poids
+aux présences et aux backgrounds de sorte que la somme du poids des présences
+et des backgrounds soit égale. Cependant, cette méthode fonctionne mal sur 
+certains modèles comme le random forest, et il faut alors le paramétrer de 
+manière plus fine avec un rééchantillonnage à 50/50 en interne. 
+
+Par ailleurs, il est important de noter que l'évaluation des modèles avec la
+validation croisée n'est pas un élément validant la robustesse du modèle. Elle
+est plutôt à considérer comme un élément qui élimine les mauvais modèles, mais
+elle ne constitue pas une preuve de robustesse quand elle est bonne, car elle
+est limitée à la fois par la nature des données (présence-seule, pas 
+d'absences), et par la possibilité qu'il y ait des biais dans 
+l'échantillonnage. Ainsi, il est difficile d'utiliser la validation croisée
+pour identifier les meilleurs modèles ; il vaut mieux donc se baser sur des 
+paramètres établis pour être robustes en situation de présence-seule (e.g.,
+Valavi et al. 2021).
+ 
+Préparons donc la calibration de nos modèles :
+
+
+ 
+```{r warning=FALSE,message=FALSE}
+calib_summary <- 
+  summary(run_data, calib.lines =  table_cv) %>% 
+  filter(dataset == "calibration")
+
+iwp <- (10^6)^(1 - occurrences)
+
+
+RF_param_list <- NULL
+GLM_param_list <- NULL
+GBM_param_list <- NULL
+XGBOOST_param_list <- NULL
+XGBOOST_param_list <- NULL
+GAM_param_list <- NULL
+MARS_param_list <- NULL
+XGBOOST_param_list <- NULL
+for (cvrun in 1:nrow(calib_summary)) {
+  
+  prNum <- calib_summary$Presences[cvrun]
+  bgNum <- calib_summary$True_Absences[cvrun]
+
+  wt <- ifelse(occurrences == 1, 1, prNum / bgNum)
+
+  RF_param_list[[paste0("_",
+                        calib_summary$PA[[cvrun]],
+                        "_",
+                        calib_summary$run[[cvrun]])]] <-
+    list(ntree = 1000,
+         sampsize =  c("0" = prNum,
+                       "1" = prNum),
+         replace = TRUE)
+  
+  GLM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-
+    list(weights = wt)
+  
+  
+  GBM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-
+    list(interaction.depth = 5,
+         n.trees = 5000, 
+         shrinkage = 0.001,
+         bag.fraction = 0.75,
+         cv.folds = 5,
+         weights = wt)
+  
+  GAM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-     
+    list(weights = wt)
+  
+  MARS_param_list[[paste0("_",
+                          calib_summary$PA[[cvrun]],
+                          "_",
+                          calib_summary$run[[cvrun]])]] <- 
+    list(weights = wt)
+  
+  XGBOOST_param_list[[paste0("_",
+                             calib_summary$PA[[cvrun]],
+                             "_",
+                             calib_summary$run[[cvrun]])]] <-
+    list(nrounds = 10000,
+         eta = 0.001,
+         max_depth = 5,
+         subsample = 0.75,
+         gamma = 0,
+         colsample_bytree = 0.8,
+         min_child_weight = 1,
+         weight = wt,
+         verbose = 0)
+}
+
+model_parameters <- bm_ModelingOptions(
+  data.type = "binary",
+  models = c("RF", "GLM", "GBM", "GAM.gam.gam", "MARS", "MAXNET", "XGBOOST"),
+  strategy = "user.defined",
+  user.base = "default",
+  user.val = list(
+    GLM.binary.stats.glm = GLM_param_list,
+    GBM.binary.gbm.gbm = GBM_param_list,
+    GAM.binary.mgcv.gam = GAM_param_list,
+    MARS.binary.earth.earth = MARS_param_list,
+    RF.binary.randomForest.randomForest = RF_param_list,
+    XGBOOST.binary.xgboost.xgboost = XGBOOST_param_list
+  ),
+  bm.format = run_data,
+  calib.lines = table_cv
+)
+
+
+
+```
+
+L'étape précédente sert à définir des paramètres appropriés pour tous les 
+modèles ; cependant, nous n'allons pas utiliser tous les modèles. Nous allons
+maintenant sélectionner les modèles qui seront effectivement lancés. Ce choix
+est basé sur les tests préliminaires qui ont mis en évidence les modèles 
+donnant des résultats cohérents, par rapport aux modèles ne donnant pas des
+résultats cohérents :
+
+ - les modèles GLM, MARS et MAXNET donnaient des réponses biologiquement 
+ irréalistes en U 
+ 
+ - le modèle GAM donnait des réponses linéaires monotones pour 
+ toutes les variables, alors que la plupart des autres modèles donnaient 
+ des réponses non linéaires
+ 
+ - le modèle XGBOOST présente un fort défaut de surajustement (overfitting), qui
+ fait qu'il ne donne des valeurs de favorabilité élevées que pour les zones où
+ des occurrences ont été recensées, avec des courbes de réponse en dents de scie
+ 
+ 
+Au final, deux modèles ont donc été retenus pour ce groupe : RF et GBM.
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+model_list <- c("RF", "GBM")
+```
+
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+model_runs <- BIOMOD_Modeling(
+  run_data,
+  modeling.id = "1", # ID de modélisation, on met 1 pour tous nos modèles ici
+  models = model_list, # Liste des modèles finaux à faire tourner
+  OPT.strategy = "user.defined",
+  OPT.user = model_parameters, # Paramètres des modèles
+  CV.strategy = "user.defined", # Méthode de validation croisée
+  CV.user.table = table_cv, # Plis générés précéemment
+  CV.do.full.models = FALSE,
+  var.import = 10, # Nombre de répétitions d'importance des variables
+  metric.eval = "BOYCE",
+  do.progress = FALSE,
+  nb.cpu = 16 # Nombre de coeurs à utiliser pour la modélisation
+  # A ajuster selon votre ordinateur, ne pas en mettre trop !
+)
+saveRDS(model_runs, file = "models/libellules/model_runs.RDS")
+```
+
+
+# Evaluation des modèles
+
+```{r}
+evals_boyce <- get_evaluations(model_runs)
+ggplot(evals_boyce, aes(x = algo, y = validation)) +
+  geom_point(aes(col = run)) +
+  xlab("Algorithme") +
+  ylab("Indice de Boyce") +
+  labs(col = "Plis de\nvalidation\ncroisée") +
+  ylim(0, 1) +
+  theme_minimal()
+```
+
+L'indice de Boyce est un indice qui varie entre -1 et 1 (-1 = prédictions
+opposées à la réalité, 0 = prédiction nulles, 1 = prédictions parfaites). Ici,
+l'indice suggère des évaluations élevées pour tous les 
+modèles, ce qui est encourageant : aucun modèle n'a échoué à prédire les
+occurrences qui n'ont pas servi à la calibration.
+
+Il faut néamoins toujours être prudent sur l'interprétation des métriques 
+d'évaluation car il s'agit de modèles corrélatifs et parce que l'évaluation est
+effectuée sur les données d'occurrence qui peuvent être biaisées. Ces métriques
+nous indiquent principalement qu'aucun modèle n'a donné de très mauvais 
+résultats, c'est l'information à en retirer. En revanche, il faut se garder
+de la fausse impression de robustesse que peuvent donner de bonnes métriques,
+car les modèles peuvent faire de bonnes prédictions avec des variables qui
+n'ont pas de sens pour la biologie des espèces. La prochaine étape consiste 
+donc à étudier les réponses des espèces aux variables environnementales.
+
+
+# Importance des variables et courbes de réponse
+
+
+```{r}
+varimp <- get_variables_importance(model_runs)
+
+varimp$expl.var <- reorder(varimp$expl.var,
+                           varimp$var.imp,
+                           median,
+                           na.rm = TRUE)
+
+library(dplyr)
+
+varimp %>%
+  group_by(expl.var) %>%
+  summarise(median = median(var.imp))
+
+ggplot(varimp) + 
+  geom_boxplot(aes(x = expl.var, y = var.imp)) +
+  geom_jitter(aes(x = expl.var, y = var.imp, col = algo),
+              alpha = .3) +
+  coord_flip() +
+  theme_minimal() +
+  xlab("Variable prédictive") +
+  ylab("Importance des variables") +
+  labs(col = "Algorithme")
+
+```
+
+
+# Courbes de réponse
+
+```{r, fig.height = 6, fig.width = 6, warning = FALSE}
+# Variables utilisées pour la calibration
+cur_vars <- model_runs@expl.var.names
+
+# Calcul des courbes de réponse
+resp <- bm_PlotResponseCurves(bm.out = model_runs,
+                              fixed.var = "mean",
+                              data_species = occurrences,
+                              do.plot = FALSE,
+                              do.progress = FALSE)$tab
+
+colnames(resp) <- c("Index", "Variable", "Var.value", "Model", "Response")
+
+for (model in model_list) {
+  p <- ggplot(resp[grep(model, resp$Model), ], 
+              aes(x = Var.value, y = Response)) + 
+    geom_line(alpha = 0.2, aes(group = Model)) + 
+    stat_smooth() +
+    facet_wrap(~ Variable, scales = "free_x") + 
+    theme_bw() + 
+    ylim(0, 1.1) + 
+    xlab("Valeurs des variables") +
+    ylab("Réponse") +
+    ggtitle(model)
+  
+  print(p)
+}
+
+
+```
+
+*Note: la courbe bleue est une aide pour visualiser la tendance, mais la vraie réponse des modèles correspond aux courbes grises*
+
+Le prédicteur le plus important de la répartition des libellules est la température minimale annuelle, ce groupe préférant des zones qui ne descendent presque jamais sous les 5°C. Ce résultat est cohérent au regard de la distribution connue des libellules du groupe, qui est quasi-exclusivement observé dans les zones de basse altitude de la Corse, très peu sujettes au risque de gel. Les autres variables climatiques jouent également, avec une préférence pour des zones chaudes en été (> 25°C) mais qui restent relativement humides durant la période déficitaire en pluie, sans déficit excessif ou surabondance d’humidité.
+
+Les zones humides sont, comme attendu, le deuxième facteur qui prédit le mieux la répartition de ce groupe, avec un effet de plateau : la favorabilité de l’habitat augmente rapidement entre 0 et 25% de recouvrement de zones humides, et se stabilise ensuite à un niveau élevé au-delà de 25%.
+
+Les modèles ont relevé un effet de la densité de population humaine, avec un effet positif d’une densité de population modérée, qui devient négatif à trop forte densité. Cela traduit probablement le fait que de nombreux milieux humides se trouvent dans les zones urbaines en Corse ; cependant une densité de population humaine trop élevée – corrélée à un degré d’urbanisation élevé – a un effet négatif, probablement par l’absence de milieux d’eau douce ou leur artificialisation excessive. 
+
+Enfin, la variable liée aux vents a également un effet, avec une préférence pour les zones légèrement venteuses qui ne sont pas exposée aux vents excessifs, ce qui est également conforme à nos hypothèses initiales.
+
+# Cartes
+
+```{r, fig.width = 6, fig.height = 3, message=FALSE, warning=FALSE, results='hide'}
+# On ne va garder que les modèles qui ont un indice de Boyce suffisamment élevé
+models_to_proj <- evals_boyce$full.name[which(evals_boyce$validation >= 0.75)]
+
+
+projection_runs <- BIOMOD_Projection(
+  bm.mod = model_runs, # Modèles calibrés
+  proj.name = "corse", # Nom de la projection actuelle
+  new.env = env_libellules, # Données environnementales sur lesquelles on projette les modèles
+  models.chosen = models_to_proj, # Modèles à projeter
+  build.clamping.mask = TRUE, # Le clamping mask illustre les zones où les prédictions sont en dehors des valeurs
+  # utilisées lors de la calibration
+  nb.cpu = 4)
+
+cartes_individuelles <- rast("models/libellules/proj_corse/proj_corse_libellules.tif")
+
+
+# Rescaling des projections qui dépassent l'intervalle 0 - 1000
+cartes_individuelles[cartes_individuelles < 0] <- 0
+cartes_individuelles[cartes_individuelles > 1000] <- 1000
+
+for(i in 1:ceiling(nlyr(cartes_individuelles) / 2)) {
+  plot(cartes_individuelles[[(i * 2 - 1):
+                               min(nlyr(cartes_individuelles),
+                                   (i * 2))]], 
+       col = viridis::inferno(12))
+}
+
+
+```
+
+Les cartes individuelles des différents modèles sont relativement convergentes
+dans leurs prédictions, avec quelques variations entre RF et GBM, notamment dans
+les zones à favorabilité intermédiaire : les modèles GBM ont tendance à
+donner des prédictions plus marquées avec peu de zones à favorabilité 
+intermédiaire, contrairement aux RF qui prédisent des zones à favorabilité
+intermédiaire plus larges.
+
+# Carte finale
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_finale <- mean(cartes_individuelles)
+ggplot() +
+  geom_spatraster(data = carte_finale) +
+  scale_fill_viridis(option = "inferno") +
+  geom_point(data =  P_points[which(P_points$occurrence == 1), ],
+             aes(x = x, y = y),
+             shape = 21,
+             fill = "#21908CFF",
+             col = "white",
+             size = 1) +
+  ggtitle("Indice de favorabilité final") +
+  xlab("Longitude") + 
+  ylab("Latitude") +
+  theme_minimal()
+
+```
+
+
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_incertitude <- app(cartes_individuelles, sd)
+ggplot() +
+  geom_spatraster(data = carte_incertitude) +
+  scale_fill_continuous(type = "viridis") +
+  ggtitle("Incertitude\n(écart-type des probabilités)") +
+  theme_minimal()
+```
+
+La carte de l’indice de favorabilité final représente très bien la distribution connue des espèces inclues dans ce groupe. Elle illustre essentiellement les milieux de basse altitude pourvus de zones humides. On peut noter deux limites intéressantes : d’une part, l’existence de nombreuses zones à forte favorabilité pour lesquelles il n’y a pas d’observations connues. On peut supposer que l’absence d’observations est due à des déficits d’échantillonnage, hypothèse qu’il faudrait tester en allant valider les modèles sur le terrain. Ensuite, on note quelques occurrences dans des zones à faible favorabilité, notamment au centre nord de la Corse ainsi qu’à l’Ouest. On peut supposer qu’il s’agit ici d’occurrences accidentelles, ou bien qu’elles sont situées dans des zones avec des questions microclimatiques favorables qui sont mal représentées par nos variables à notre échelle d’étude, ou enfin qu’il s’agit de zones favorables mais insuffisamment échantillonnées. Encore une fois, il faudrait évaluer ces hypothèses par une prospection terrain pour valider les modèles. 
+
+Cette carte a été jugée très cohérente par rapport aux espèces inclues dans le groupe d’après l’expert consulté.  Néanmoins, l’expert a indiqué que cette carte exclut d’autres espèces à enjeux – localisées dans les ruisseaux semi-temporaires de piémonts – qui ne font pas partie du groupe d’espèces étudié ici. 
+
+La carte d’incertitude illustre deux types d’incertitude : d’une part, une incertitude ponctuellement très élevée dans pour les occurrences localisées dans des zones dont l’environnement diffère de la plupart des autres observations du groupe (centre nord de la Corse et ouest), et qui donc sont difficiles à prédire par les modèles. Ensuite, une incertitude notable dans les zones à favorabilité d’habitat intermédiaire, incertitude qui est généralement attendue car ces zones sont difficiles à prédire avec précision par les modèles. 
+
+
+
+## Carte de potentiel d'habitat
+
+
+Pour créer la carte de potentiel d'habitat final, nous allons représenter 
+trois catégories de potentiel d'habitat, en respectant les contraintes 
+d'interprétation sur les modèles en présence seule. En effet, les modèles en
+présence seule ne peuvent pas fournir d'information sur la probabilité de
+présence. Par conséquent, ils ne peuvent informer sur les habitats défavorables 
+- ils informent seulement sur les habitats favorables compte-tenu des 
+connaissances actuelles.
+
+Ainsi, nous ne produirons pas de carte binaire "présence-absence" qui n'aurait
+pas de sens dans le cadre des modèles en présence-seule et qui est également une
+sur-simplification de la réalité biologique, qui n'est jamais binaire.
+Nous allons plutôt
+représenter trois catégories : 
+
+ - les zones à fort potentiel d'habitat
+ - les zones à potentiel d'habitat intermédiaire 
+ - les zones à potentiel d'habitat faible ou méconnu
+ 
+Pour établir une méthode permettant de définir ces trois catégories, on peut
+étudier comment les occurrences sont réparties sur le gradient de favorabilité
+des modèles. On peut alors utiliser les quantiles des occurrences pour 
+identifier les seuils séparant les catégories.
+
+
+```{r, fig.width = 6, fig.height = 2, message = FALSE}
+favorabilite_presences <- extract(carte_finale,
+                                  P_points[which(P_points$occurrence == 1),
+                                           c("x", "y")],
+                                  ID = FALSE)
+qt_favorabilite <- quantile(favorabilite_presences$mean, probs = c(.05, .25))
+
+
+ggplot(favorabilite_presences) +
+  geom_boxplot(aes(x = mean),
+               col = "darkgrey") +
+  geom_vline(xintercept = qt_favorabilite,
+             col = c("#1b9e77", "#7570b3"),
+             linetype = 2,
+             linewidth = 2) +
+  theme_minimal() +
+  xlab("Indice de favorabilité") +
+  scale_y_continuous(breaks = 0,
+                     labels = "Occurrences") +
+  xlim(0, 1000)
+```
+Dans le graphe ci-dessus, on voit la répartition des occurrences sur l'indice
+de favorabilité produit par le modèle. On peut utiliser les quantiles à 5% et 
+25% (représentés par les pointillés bleus) pour séparer les catégories. 
+
+ - La zone à droite du quantile à 25% (le trait mauve) contient l'essentiel des 
+ occurrences du groupe d'espèces, ce qui signifie qu'au delà de ce seuil, 
+ le **potentiel d'habitat est élevé**. 
+
+ - La zone entre le quantile à 5% (trait vert) et à 25% (trait mauve) est une
+ zone à favorabilité plus faible mais qui contient tout de même 20% des 
+ occurrences du groupe. On peut ainsi la caractériser comme **zone à potentiel
+ d'habitat intermédiaire**. 
+ 
+ - La zone à gauche du quantile à 5% (trait vert) contient moins de 5% des
+ occurrences du groupe. Il s'agit donc de valeurs de favorabilité plutôt faibles
+ puisqu'elles ne semblent pas ou peu occupées d'après les connaissances 
+ actuelles. On peut donc qualifier cette catégorie de **potentiel d'habitat 
+ faible ou méconnu**.
+ 
+ Si l'on utilise ces seuils pour illustrer la répartition de ces trois 
+ catégories, on obtient la carte suivante :
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_indice <- carte_finale
+carte_indice[carte_finale < qt_favorabilite["5%"]] <- 0
+carte_indice[carte_finale >= qt_favorabilite["5%"] &
+               carte_finale < qt_favorabilite["25%"]] <- 1
+carte_indice[carte_finale >= qt_favorabilite["25%"]] <- 2
+
+carte_indice <- as.factor(carte_indice)
+
+ggplot() + 
+  geom_spatraster(data = carte_indice) +
+  scale_fill_manual(values = viridis::plasma(3),
+                    name = paste0("Potentiel d'habitat\n(% du total",
+                                  " d'occurrences\n",
+                                  "observé dans cette classe\n",
+                                  "de favorabilité)"),
+                    labels = c("Faible ou méconnu (< 5%)",
+                               "Intermédiaire (5-25%)",
+                               "Elevé (75%)"),
+                    na.translate = F)
+
+```
+
+La carte du potentiel d’habitat illustre les zones à fort potentiel d’habitat qui concentrent l’essentiel des occurrences (les zones en jaune contiennent 75% du total des observations du groupe). Ces zones sont relativement limitées à l’échelle de la Corse, concentrées sur en quelques zones localisées sur la côte nord, est et sud-est de l’île. Les zones à potentiel d’habitat intermédiaire possèdent un indice de favorabilité plus faible, mais qui concentrent malgré tout 20% des observations connues du groupe, et sont localisées soit en bordure des zones à fort potentiel, soit en d’autres endroits côtiers, notamment à l’est, au nord-ouest et au sud-ouest de l’île. Cette carte a été considérée cohérente par l’expert consulté pour les espèces du groupe, même si elle exclut d’autres espèces à enjeux. 
+
+# Sauvegarde des cartes en fichiers SIG
+
+```{r}
+writeRaster(carte_finale,
+            "outputs/carte_libellules_indicemoy.tif", overwrite = TRUE)
+writeRaster(carte_incertitude,
+            "outputs/carte_libellules_incertitude.tif", overwrite = TRUE)
+writeRaster(carte_indice,
+            "outputs/carte_libellules_potentielhabitat.tif", overwrite = TRUE)
+
+```

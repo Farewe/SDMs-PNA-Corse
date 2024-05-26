@@ -1,0 +1,706 @@
+---
+title: "Carte des variables environnementales finales"
+author: "Boris Leroy"
+date: "`r Sys.Date()`"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    toc: yes
+    toc_depth: 1
+    df_print: paged
+---
+
+
+Chargement des données
+```{r, results='asis'}
+library(sf)
+library(ggplot2)
+library(terra)
+fra <- st_read("data/fra.gpkg")
+env_corse <- rast("data/env_corse_total_sync.tif")
+```
+
+
+# 1. Données climatiques : source de données CHELSA
+
+## Description et méta-données
+
+**Téléchargement :** www.chelsa-climate.org
+
+**Intervalle temporel :** 1981-2010
+
+**Type de données :** Raster
+
+**Résolution initiale :** 0.0083333° 
+
+**Méta-données :** 
+https://chelsa-climate.org/wp-admin/download-page/CHELSA_tech_specification_V2.pdf
+
+**Références bibliographiques :**
+
+- Brun, P., Zimmermann, N.E., Hari, C., Pellissier, L., Karger, D. (2022): Data 
+from: CHELSA-BIOCLIM+ A novel set of global climate-related predictors at 
+kilometre-resolution. *EnviDat*. https://doi.org/10.16904/envidat.332
+
+- Karger D.N., Conrad, O., Böhner, J., Kawohl, T., Kreft, H., Soria-Auza, R.W.,
+Zimmermann, N.E, Linder, H.P., Kessler, M. (2018): Data from: Climatologies at 
+high resolution for the earth’s land surface areas. *EnviDat*. 
+https://doi.org/10.16904/envidat.228.v2.1
+
+- Karger, D.N., Conrad, O., Böhner, J., Kawohl, T., Kreft, H., Soria-Auza, R.W.,
+Zimmermann, N.E., Linder, P., Kessler, M. (2017): Climatologies at high 
+resolution for the Earth land surface areas. *Scientific Data*. 4 170122. 
+https://doi.org/10.1038/sdata.2017.122
+
+- Brun, P., Zimmermann, N.E., Hari, C., Pellissier, L., Karger, D.N. (preprint):
+Global climate-related predictors at kilometre resolution for the past and 
+future. *Earth Syst. Sci. Data Discuss.* https://doi.org/10.5194/essd-2022-212
+
+**Licence :** Creative Commons Zero - No Rights Reserved (CC0 1.0)
+
+**Description des variables :**
+Les variables bioclimatiques (variables bio1 à bio19) sont décrites dans [Karger
+et al. 2017](https://doi.org/10.1038/sdata.2017.122). Les autres variables sont
+décrites dans [Brun et al. (2022)](https://doi.org/10.5194/essd-2022-212).
+La variable de température minimale de la saison estivale pour les chiroptères
+a été calculée à partir des valeurs mensuelles de température minimale pour les
+mois de mai à septembre.
+
+## Illustration des variables
+
+```{r, results='asis'}
+vars <- xlsx::read.xlsx("data/chelsa_variable_names.xlsx",
+                  sheetIndex = 1)
+
+for(i in 1:54){
+    plot(env_corse[[i]],
+         col = viridis::plasma(12),
+         main = vars$longname[i])
+    plot(st_geometry(fra), add = TRUE,
+         border = grey(0.3))
+    print(knitr::kable(vars[i, ]))
+}
+
+plot(env_corse[["tasmin_chiro"]],
+     col = viridis::plasma(12),
+     main = "Température minimale de la saison estivale")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+```
+
+# 2. Données routes
+
+## Description et méta-données
+
+**Téléchargement :** https://geoservices.ign.fr/bdcarto
+
+**Intervalle temporel :** 2023
+
+**Type de données :** Vectoriel
+
+**Précision :** 1:50000 à 1:200000
+
+**Méta-données :** 
+https://geoservices.ign.fr/documentation/donnees/vecteur/bdcarto
+
+
+**Références bibliographiques :**
+
+**Licence :** licence ouverte Etalab 2.0
+
+**Description des variables :** Distance à la plus proche cellule possédant une
+route en mètres
+
+## Illustration des variables
+
+```{r, results='asis'}
+plot(env_corse[["distance_routes"]],
+     col = viridis::plasma(12),
+     main = "Distance aux routes")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+
+```
+
+
+# 3. Données hydrographiques
+
+## Description et méta-données
+
+**Téléchargement :** https://geoservices.ign.fr/bdtopo
+
+**Intervalle temporel :** 2023
+
+**Type de données :** Vectoriel
+
+**Précision :** 1:2000 à 1:50000
+
+**Méta-données :** 
+https://geoservices.ign.fr/documentation/donnees/vecteur/bdtopo
+
+**Références bibliographiques :**
+
+
+**Licence :** licence ouverte Etalab 2.0
+
+**Description des variables :**
+Les cours d'eau et les plans d'eau ont été fournis par la DREAL de Corse en 
+résolution très fine (environ 0.0026 * 0.0017°), présence-absence par cellule. 
+Ils ont été agrégés à la résolution des variables climatiques (0.0083333°) pour
+créer deux variables :
+ 
+ - la proportion de milieux d'eau douce dans chaque cellule de 0.0083333°
+ 
+ - la distance aux milieux d'eau douce, calculée comme la distance à la cellule
+ la plus proche contenant au moins un milieu d'eau douce, en mètres
+ 
+## Illustration des variables
+
+```{r, results='asis'}
+
+plot(env_corse[["milieux_eaudouce"]],
+     col = viridis::plasma(12),
+     main = "Proportion de milieux d'eau douce")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+
+plot(env_corse[["dist_moy_eau"]],
+     col = viridis::plasma(12),
+     main = "Distance aux milieux d'eau douce (m)")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+
+```
+
+
+# 4. Zones humides
+
+## Description et méta-données
+
+**Téléchargement :** 
+https://www.rhone-mediterranee.eaufrance.fr/sites/sierm/files/content/2022-03/Couches%20geo%20EHR%20et%20pressions_%20RMC.zip
+
+**Intervalle temporel :** 
+
+**Type de données :** Vectoriel
+
+**Résolution initiale :**  25m
+
+**Méta-données :** 
+
+https://www.rhone-mediterranee.eaufrance.fr/preservation-et-restauration-des-milieuxzones-humides/la-politique-du-bassin-en-faveur-des-zones
+
+
+**Références bibliographiques :**
+
+CHAMBAUD F., BOUSCARY P. 2022. L’espace humide de référence : un nouveau 
+référentiel en appui à la gestion des zones humides. Concept, méthode, 
+résultats, utilisation. Collection Eau & Connaissance. Agence de l’eau Rhône
+Méditerranée Corse. 63p + annexes.
+
+**Licence :** Non précisée, mais probablement libre accès Etalab 2.0 étant donné
+qu'il est basé sur des bases de données Etalab 2.0
+
+**Description des variables :**
+Les données ont été fournies par la DREAL au format en résolution fine  
+(0.002592892 * 0.00165493°), format présence par maille. Elles ont été agrégées
+à la résolution des variables climatiques (0.0083333°) pour
+créer deux variables :
+ 
+- la proportion de zones humides dans chaque cellule de 0.0083333°
+  
+ - la distance aux zones humides, calculée comme la distance à la cellule
+ la plus proche contenant au moins une zone humide potentielle, en mètres
+ 
+
+
+
+## Illustration des variables
+
+```{r, results='asis'}
+
+plot(env_corse[["potentielles_zh"]],
+     col = viridis::plasma(12),
+     main = "Proportion de zones humides potentielles")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+
+plot(env_corse[["dist_moy_pzh"]],
+     col = viridis::plasma(12),
+     main = "Distance aux zones humides (m)")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+
+```
+
+
+# 5. Occupation du sol Corine Land Cover
+
+## Description et méta-données
+
+**Téléchargement :** 
+https://www.data.gouv.fr/fr/datasets/r/06aabb52-cfd9-46c7-bde6-f732d73af81f
+
+**Intervalle temporel :** 2018
+
+**Type de données :** Vectoriel
+
+**Précision :**  1/100000 
+
+**Méta-données :** 
+https://www.statistiques.developpement-durable.gouv.fr/corine-land-cover-0
+
+
+**Références bibliographiques :** 
+
+https://www.statistiques.developpement-durable.gouv.fr/media/2459/download?inline
+
+https://land.copernicus.eu/content/corine-land-cover-nomenclature-guidelines/docs/pdf/CLC2018_Nomenclature_illustrated_guide_20190510.pdf
+
+
+**Licence :** Licence ouverte ETALAB
+
+**Description des variables :**
+Les données vectorielles Corine Land Cover ont été transformées en rasters
+à la résolution des variables climatiques (0.0083333°) en calculant la proportion
+de chaque classe dans chaque pixel. Plusieurs variables spécifiques ont été
+créées ; cf. documents fournis dans références bibliographiques pour les codes :
+
+- Le **bâti peu dense**, pour les chiroptères, en utilisant les classes 112 
+(tissu urbain discontinu) et 131 (extraction de matériaux) qui peuvent 
+représenter des bâtiments isolés et des mines utilisables par les chiroptères
+
+- Les **zones ouvertes**, pour la végétation des serpentinites, en utilisant
+les classes 332 (zones nues) et 333 (végétation clairsemée)
+
+- Les **zones herbacées et arbustives**, pour l'habitat des papillons, en 
+utilisant la classe 32 (Milieux à végétation arbustive et/ou herbacée)
+
+- Les **milieux forestiers**, pour les amphibiens et les chiroptères, en 
+utilisant la classe 31 (forêts)
+
+- Les **surfaces agricoles cultivées**, en utilisant les classes 211 
+(terres arables),
+221 (vignobles), 222 (vergers et petits fruits) et 223 (oliveraies)
+
+- Les **zones artificialisées**, en utilisant les classes 111 (tissu urbain 
+continu), 112 (tissu urbain discontinu), 121 (zones industrielles ou 
+commerciales), 123 (zones portuaires), 124 (aéroports), 131 (extraction de 
+matériaux), 132 (décharges)
+
+D'autres variables ont été générées à partir de ces variables initiales :
+
+- La **distance au bâti peu dense** (distance à la plus proche cellule avec du 
+bâti peu dense) en mètres
+
+- La **distance aux forêts** (distance à la plus proche cellule avec des forêts)
+en mètres
+
+- L'**hétérogénéité du paysage**, calculée comme l'indice de simpson sur la 
+proportion de chaque classe d'habitat naturel non marin dans chaque cellule 
+(habitats des classes 1 et 5 exclus). 
+Formule utilisée pour chaque cellule : $1 - \sum{x_i^2}$ où $x_i$ est la 
+proportion de recouvrement de l'habitat *i* dans la cellule
+
+## Illustration des variables
+
+```{r, results='asis'}
+
+plot(env_corse[["bati_peu_dense"]],
+     col = viridis::plasma(12),
+     main = "Bâti peu dense")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+plot(env_corse[["dist_bati_peu_dense"]],
+     col = viridis::plasma(12),
+     main = "Distance au bâti peu dense")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+plot(env_corse[["zones_ouvertes"]],
+     col = viridis::plasma(12),
+     main = "Zones ouvertes")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+plot(env_corse[["vege_herb"]],
+     col = viridis::plasma(12),
+     main = "Végétation herbacée et arbustive")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+plot(env_corse[["forets"]],
+     col = viridis::plasma(12),
+     main = "Forêts")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+plot(env_corse[["dist_forets"]],
+     col = viridis::plasma(12),
+     main = "Distance aux forêts")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+plot(env_corse[["milieux_agri"]],
+     col = viridis::plasma(12),
+     main = "Milieux agricoles")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+plot(env_corse[["zones_artif"]],
+     col = viridis::plasma(12),
+     main = "Zones artificielles")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+plot(env_corse[["simpson_landscapediv"]],
+     col = viridis::plasma(12),
+     main = "Diversité d'habitats (simpson)")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+
+```
+
+
+# 6. Pollution lumineuse
+
+## Description et méta-données
+
+**Téléchargement :** 
+https://eogdata.mines.edu/nighttime_light/monthly/v10/
+
+**Intervalle temporel :** 2013-2019
+
+**Type de données :** raster
+
+**Résolution initiale :** 0.00416667 * 0.00416667°
+
+**Méta-données :** 
+https://eogdata.mines.edu/products/vnl/
+
+**Références bibliographiques :** 
+
+ - C. D. Elvidge, K. Baugh, M. Zhizhin, F. C. Hsu, and T. Ghosh, “VIIRS night-time
+lights,” *International Journal of Remote Sensing*, vol. 38, pp. 5860–5879, 2017
+
+
+**Licence :** CC-BY-4.0 This product was made utilizing (VIIRS night-time
+lights) data produced by the Earth Observation Group, Payne Institute for
+Public Policy, Colorado School of Mines.
+
+**Description des variables :**
+Cette variable a été utilisée pour les chiroptères pour la période estivale.
+Les données de pollution lumineuse mensuelle 
+moyenne ont été téléchargées pour les mois d'août et de septembre de 2013 à 
+2019 (seuls mois de la période estivale disponibles complètement pour toutes 
+les années). Les données ont d'abord été agrégées à la résolution des variables
+climatiques (0.0083333°) par interpolation bilinéaire. La couche finale de
+pollution lumineuse a été obtenue en moyennant
+les valeurs sur les mois d'août et de septembre et entre toutes les années. La
+variable finale est une radiance moyenne en nW cm−2 sr−1.
+
+
+## Illustration des variables
+
+```{r, results='asis'}
+
+plot(env_corse[["pollum"]],
+     col = viridis::plasma(12),
+     main = "Pollution lumineuse")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+
+```
+
+# 7. Connectivité, intégrité biophysique et naturalité 
+
+## Description et méta-données
+
+**Téléchargement :** 
+https://uicn.fr/CartNat/CartNat_Donnees/
+
+**Intervalle temporel :** 2000-2023
+
+**Type de données :** raster
+
+**Résolution initiale :**  20 * 20 m
+
+**Méta-données :** 
+https://uicn.fr/CartNat/CartNat_Donnees/Note_technique_m%c3%a9thodologique/Projet%20CARTNAT_note%20technique_2021.pdf
+https://uicn.fr/aires-protegees/wilderness/
+
+
+**Références bibliographiques :** 
+ - Guetté A, Carruthers-Jones Jonathan, Carver Stephen J. 2021. Projet CARTNAT
+Cartographie de la Naturalité. Notice technique. Comité français de l'IUCN.
+https://uicn.fr/CartNat/CartNat_Donnees/Note_technique_m%c3%a9thodologique/Projet%20CARTNAT_note%20technique_2021.pdf
+
+ - Guetté A., Carruthers-Jones J., Godet L., Robin M. 2018. « Naturalité » : 
+concepts et méthodes appliqués à la
+conservation de la nature. Cybergeo: European Journal of Geography [En ligne],
+document 856. URL :
+https://journals.openedition.org/cybergeo/29140#toc
+
+**Licence :** CC-BY-NC
+
+**Description des variables :**
+La naturalité est un indice composée de trois variables :
+
+ - **l’intégrité biophysique de l’occupation du sol**, qui traduit un état 
+ d’éloignement d’un paysage à ce qu’il serait sans transformation anthropique.
+ Elle intègre notamment les notions de continuité temporelle de l'état boisé et 
+ de probabilité de non exploitation forestière, importantes pour plusieurs 
+ espèces/groupes d'espèces sujettes au Plan National d'Action. Cette variable
+ est un indice relatif allant de 1 à 255, la valeur de 255 indiquant une forte
+ intégrité.
+ 
+ - **la spontanéité des processus**, qui évalue le degré d’intervention humaine 
+ sur les dynamiques naturelles. Il s'agit ici d'un proxy d'influence humaine 
+ basé sur la distance aux routes et la densité de bâti. Il s'agit d'un indice 
+ variant de 1 à 15000, la valeur de 15000 indiquant une forte spontanéité. 
+ *Note* Etant donné que la variable "distance aux routes" est fortement utilisée
+ pour contrôler le biais d'échantillonnage, cette variable spontanéité n'a pas
+ été retenue pour le projet PNA Corse.
+ 
+ - **les continuités spatiales**, qui correspondent au degré de connectivité des
+ paysages. Elle a été calculée avec un modèle dédié appelé "Omniscape" (cf. 
+ références ci-dessus). Il s'agit d'un indice variant de 1 à 400, la valeur de 
+ 400 indiquant une forte continuité 
+ 
+**L'indice de naturalité** final est la somme des trois variables, pondérées de 
+manière égale, et représenté sur une échelle allant de 1 à 700, la valeur de 700
+indiquant une forte naturalité.
+
+![](graphs/figure_naturalite.png)
+
+## Illustration des variables
+
+```{r, results='asis'}
+
+plot(env_corse[["integrite"]],
+     col = viridis::plasma(12),
+     main = "Intégrité biophysique des sols")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+plot(env_corse[["connectivite"]],
+     col = viridis::plasma(12),
+     main = "Connectivité")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+plot(env_corse[["naturalite"]],
+     col = viridis::plasma(12),
+     main = "Naturalité")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+
+```
+
+# 8. Densité de population humaine
+
+## Description et méta-données
+
+**Téléchargement :** 
+https://sedac.ciesin.columbia.edu/data/set/popdynamics-1-km-downscaled-pop-base-year-projection-ssp-2000-2100-rev01/data-download
+
+**Intervalle temporel :** 2000
+
+**Type de données :** raster
+
+**Résolution initiale :** 0.008333 * 0.008333 °
+
+**Méta-données :** 
+https://sedac.ciesin.columbia.edu/data/set/popdynamics-1-km-downscaled-pop-base-year-projection-ssp-2000-2100-rev01/metadata
+
+**Références bibliographiques :** 
+ - Gao, J. 2020. Global 1-km Downscaled Population Base Year and Projection Grids
+Based on the Shared Socioeconomic Pathways, Revision 01. Palisades, New York: 
+NASA Socioeconomic Data and Applications Center (SEDAC). 
+https://doi.org/10.7927/q7z9-9r69. 
+
+ - Gao, J. 2017. Downscaling Global Spatial Population Projections from 1/8-degree
+to 1-km Grid Cells. NCAR Technical Note NCAR/TN-537+STR.
+https://doi.org/10.5065/D60Z721H. 
+
+**Licence :** Licence libre type CC-BY
+
+**Description des variables :**
+Densité de population humaine dans chaque cellule. Les données ont été
+transformées en log10 ($log(x + 1)$), car la densité de population humaine très faible en
+Corse créait une variable à distribution trop asymétrique.
+
+
+## Illustration des variables
+
+```{r, results='asis'}
+
+plot(env_corse[["pop_dens_log10"]],
+     col = viridis::plasma(12),
+     main = "Densité de population humaine (log10)")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+
+```
+
+# 9. Biais d'échantillonnage 
+
+## Description et méta-données
+
+**Téléchargement :** 
+Non disponible en ligne
+
+**Intervalle temporel :** 2000-2023
+
+**Type de données :** raster
+
+**Précision :**  0.008333 * 0.008333°
+
+**Méta-données :** 
+
+**Références bibliographiques :** 
+
+**Licence :** 
+
+**Description des variables :**
+Il s'agit de variables créées à partir de toutes les occurrences d'un
+groupe pour servir d'indicateur de la pression d'échantillonnage et donc du 
+biais d'échantillonnage - il s'agit de la méthode "target-group sampling bias". 
+Nous avons créé une variable de ce type pour les plantes et une autre pour les
+chiroptères. 
+Pour la générer,
+toutes les occurrences d'un groupe ont été transformées en raster à la
+résolution
+des variables bioclimatiques en appliquant un kernel bi-dimensionnel avec 
+la fonction `kde2d()` du package R `MASS`.
+
+## Illustration des variables
+
+```{r, results='asis'}
+
+plot(env_corse[["occ_density_cbnc"]],
+     col = viridis::plasma(12),
+     main = "Densité des occurrences flore")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+
+plot(env_corse[["occ_density_chiro"]],
+     col = viridis::plasma(12),
+     main = "Densité des occurrences chiroptères")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+
+```
+
+# 10. Pins laricio
+
+## Description et méta-données
+
+Données issues de BD Forêt v2.0
+
+**Téléchargement :** 
+https://geoservices.ign.fr/bdforet
+
+**Intervalle temporel :** 2007-2018
+
+**Type de données :** Vecteur
+
+**Précision :**  Variable
+
+**Méta-données :** 
+https://geoservices.ign.fr/documentation/donnees/vecteur/bdforet
+
+**Références bibliographiques :** 
+
+
+**Licence :** Licence ouverte Etalab 2.0
+
+
+**Description des variables :** Proportion de forêts de pin laricio dans chaque
+cellule à la résolution des variables 
+climatiques (0.0083333°), en calculant le % d'occupation de chaque maille.
+
+## Illustration des variables
+
+```{r, results='asis'}
+
+plot(env_corse[["laricio"]],
+     col = viridis::plasma(12),
+     main = "% forêts de pin Laricio")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+
+```
+
+# 11. Cavités
+
+## Description et méta-données
+
+**Téléchargement :** 
+https://www.georisques.gouv.fr/donnees/bases-de-donnees/inventaire-des-cavites-souterraines
+
+**Intervalle temporel :** 2010
+
+**Type de données :** vecteur
+
+**Précision :**  variable selon les cavités
+
+**Méta-données :** 
+https://www.georisques.gouv.fr/donnees/bases-de-donnees/inventaire-des-cavites-souterraines
+
+**Références bibliographiques :** 
+
+**Licence :** Etalab Version 2.0 
+
+**Description des variables :**
+Ce jeu de données a servi à générer une variable de distance aux cavités pour
+les chiroptères. Les cavités dont les coordonnées étaient imprécises ont été
+éliminées (coordonnées classées en "centroide de commune" ou "imprécis"). Les
+cavités ont ensuite été transformées en raster de présence par maille à la
+résolution des données climatiques (0.0083333°). La distance à la maille la plus 
+proche avec une cavité, en mètres, a ensuite été calculée pour obtenir la 
+variable finale.
+
+## Illustration des variables
+
+```{r, results='asis'}
+
+plot(env_corse[["dist_cavites"]],
+     col = viridis::plasma(12),
+     main = "Distance aux cavités")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+
+```
+
+
+# 12. Couche géologique des serpentinites
+
+## Description et méta-données
+
+Bd Charm-50
+
+**Téléchargement :** 
+http://infoterre.brgm.fr/formulaire/telechargement-cartes-geologiques-departementales-150-000-bd-charm-50
+
+**Intervalle temporel :** 2004
+
+**Type de données :** vecteur
+
+**Précision :**  1:50000
+
+**Méta-données :** 
+http://infoterre.brgm.fr/formulaire/telechargement-cartes-geologiques-departementales-150-000-bd-charm-50
+
+**Références bibliographiques :** Janjou, D. Descriptif des cartes géologiques 
+à 1/50 000 format "vecteurs". BRGM/RP-53473-FR, 2004.
+
+**Licence :** Etalab Version 2.0 
+
+**Description des variables :**
+Seule la couche géologique des serpentinites a été extraites de cette base
+de données, et elle a été transformée en raster à la résolution des variables 
+climatiques (0.0083333°), en calculant le % d'occupation de chaque maille.
+
+## Illustration des variables
+
+```{r, results='asis'}
+
+plot(env_corse[["serpentinites"]],
+     col = viridis::plasma(12),
+     main = "% serpentinites")
+plot(st_geometry(fra), add = TRUE,
+     border = grey(0.3))
+
+```

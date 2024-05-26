@@ -1,0 +1,848 @@
+---
+title: "Sittelle Corse"
+author: "Boris Leroy"
+date: "`r format(Sys.time(), '%d/%m/%y')`"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    toc: yes
+    df_print: paged
+---
+
+### *Note sur ce template Rmarkdown*
+
+Ce fichier constitue un gabarit complet pour la modélisation des habitats 
+potentiels d'une espèce ou d'un groupe d'espèce. Il est fourni sous licence 
+libre CC-BY 4.0.
+
+Il a été testé fonctionnel sur la version de R `r R.version.string`, avec les packages
+sf (`r packageVersion("sf")`), terra (`r packageVersion("terra")`), ggplot2 
+(`r packageVersion("ggplot2")`), scales (`r packageVersion("scales")`), egg 
+(`r packageVersion("egg")`), virtualspecies 
+(`r packageVersion("virtualspecies")`), blockCV 
+(`r packageVersion("blockCV")`), biomod2 (`r packageVersion("biomod2")`),
+dplyr (`r packageVersion("dplyr")`), tidyterra (`r packageVersion("tidyterra")`). 
+
+Il est possible que des évolutions futures de packages (notamment, biomod2, qui 
+est sujet à de nombreuses évolutions en 2023 et 2024) rendent certaines parties
+du fichier non fonctionnelles, ce qui nécessitera de corriger le code.
+
+
+
+# Pré-requis :
+
+Chargement des packages et fonctions, chargement de données géographiques et
+des variables environnementales harmonisées
+
+```{r message=FALSE, warning=FALSE}
+library(sf)
+library(terra)
+library(ggplot2)
+library(scales)
+library(egg)
+library(virtualspecies)
+library(blockCV)
+library(biomod2)
+library(dplyr)
+library(tidyterra)
+source("scripts/functions.R")
+
+# Shapefile de la Corse
+corse <- st_read("data/corse.gpkg")
+# Données environnementales harmonisées
+env_corse <- rast("data/env_corse_total_sync.tif")
+```
+
+# Chargement et préparation des données d'occurrence
+
+```{r fig.height=3, fig.width=6, message=FALSE, warning=FALSE}
+sittelle <- st_read("data/donnees_brutes/taxa/sittelle.shp")
+# Simplification du nom d'espèce en binomial
+sittelle$species <- simplify_species_name(sittelle$nom_valide)
+# Dates d'échantillonnage
+sittelle$year <- as.numeric(strtrim(sittelle$date_fin, 4))
+sittelle$month <- as.numeric(substr(sittelle$date_fin, 6, 7))
+
+
+# Visualisation de la temporalité des occurrences
+ggplot(sittelle) +
+  geom_boxplot(aes(x = species,
+                   y = year))+ 
+  coord_flip() +
+  scale_y_continuous(breaks = breaks_pretty()) +
+  theme_minimal()
+```
+
+
+## Filtre temporel
+
+Il faut établir un filtre temporel pour éliminer les données imprécises, 
+sachant que l'objectif est de modéliser à une résolution assez fine, de l'ordre
+de 1km.
+Le champ `precision` est peu renseigné et donc peu utile ici, il nous faut donc
+poser une hypothèse sur les données qui sont imprécises. On peut considérer que
+les GPS ont commencé à être largement disponibles à partir de 1990, mais leur
+utilisation ne s'est généralisée qu'à partir des années 2000, notamment grâce
+à leur miniaturisation. Ainsi, on peut spéculer qu'avant les années 2000, les
+données étaient moins précisés car possiblement géolocalisées en utilisant des
+référentiels comme les lieu-dits ou les communes, tandis qu'à partir des années
+2000 la précision s'est améliorée grâce à la géolocalisation par satellite. 
+
+La quasi-totalité des données a été récoltée après 2000 :
+
+```{r fig.height=10, fig.width=6}
+# Les données avant 2000 représentent un % modéré du jeu de données : 
+100 * length(which(sittelle$year < 2000)) / nrow(sittelle)
+```
+
+La couverture temporelle sur l'année est plus importante à partir de 2010 environ :
+
+```{r fig.height=10, fig.width=10}
+ggplot(sittelle) +
+  geom_boxplot(aes(x = species,
+                   y = month)) +
+  facet_wrap(~year) + 
+  coord_flip() +
+  scale_y_continuous(breaks = breaks_pretty()) +
+  theme_minimal()
+```
+
+L'emprise spatiale des données d'occurrence change de manière modérée
+avec ou sans les données pré-2000 :
+
+```{r fig.height=7, fig.width=10}
+
+p_sittelle_all <- ggplot() +
+  geom_sf(data = corse) +
+  geom_sf(data = sittelle, aes(col = year)) +
+  scale_color_continuous(type = "viridis") + 
+  theme_minimal(base_size = 15) +
+  ggtitle("Toutes données\nsittelle")
+
+p_sittelle_post2000 <- ggplot() +
+  geom_sf(data = corse) +
+  geom_sf(data = sittelle[sittelle$year >= 2000, ], aes(col = year)) +
+  scale_color_continuous(type = "viridis") + 
+  theme_minimal(base_size = 15) +
+  ggtitle("Données post-2000\nsittelle")
+
+ggarrange(p_sittelle_all,
+          p_sittelle_post2000,
+          nrow = 1)
+```
+
+On pose donc l'hypothèse raisonnable qu'un filtre à 2000 va assurer une bonne 
+précision dans la localisation des occurrences sans perdre d'information
+critique sur la répartition de la sittelle
+
+```{r}
+sittelle <- sittelle[which(sittelle$year >= 2000), ]
+```
+
+## Rasterisation des occurrences
+
+L'objectif ici est de ne garder qu'une occurrence par cellule à la résolution 
+de nos variables environnementales afin d'éviter une forme extrême de
+pseudo-réplication.
+
+```{r}
+# On rasterise les occurrences à la résolution de nos variables 
+# environnementales
+sittelle_r <- rasterize(sittelle, 
+                             env_corse)
+names(sittelle_r) <- "sittelle" # Attention il ne faut pas nommer
+# la couche "sittelle" car il y a des variables qui s'appellent 
+# sittelle
+
+plot(sittelle_r)
+```
+
+
+On va ensuite éliminer les occurrence qui sont dans des zones sans 
+valeurs de variables environnementales. Pour cela on va combiner les variables
+environnementales avec les occurrences rasterisées dans un `data.frame`, et 
+supprimer les occurrences d'espèces qui tombent sur des données 
+environnementales manquantes
+
+```{r}
+# On crée un stack avec nos occurrences rasterisées et les variables env
+env_sittelle <- c(env_corse,
+                       sittelle_r)
+
+# On récupère les coordonnées XY de toutes les cellules, pour préparer nos
+# données finales
+coorXY <- xyFromCell(env_corse, 
+                     1:ncell(env_corse))
+# On transforme le raster en data.frame 
+env_sittelle_df <- values(env_sittelle)
+
+env_sittelle_df[is.nan(env_sittelle_df)] <- NA
+
+# On regarde le nombre d'occurrences pour lesquelles il y a des données 
+# manquantes : 
+length(which(is.na(env_sittelle_df[, "bio1"]) & 
+               !is.na(env_sittelle_df[, "sittelle"])))
+```
+
+On va maintenant supprimer les cellules pour lesquelles on n'a pas de données
+environnementales. Pour cela on va utiliser la première variable
+environnementale ici, car les données manquantes sont toutes les mêmes
+entre toutes les variables environnementales (cf. script harmonisation des
+données).
+
+
+```{r}
+# On filtre d'abord sur l'objet qui contient les coordonnées
+coorXY <- coorXY[-which(is.na(env_sittelle_df[, 1])), ]
+# Et ensuite sur le tableau avec variables env et présences d'espèces
+env_sittelle_df <- env_sittelle_df[-which(is.na(env_sittelle_df[, 1])), ]
+
+# Comparaison du nombre d'occurrences :
+# Avant rasterisation
+nrow(sittelle)
+
+# Après rasterisation et élimination des données env manquantes
+length(which(env_sittelle_df[, "sittelle"] == 1))
+```
+
+Il s'agit donc du nombre d'occurrences que l'on va pouvoir utiliser pour 
+calibrer nos modèles. Il y a 
+`r length(which(env_sittelle_df[, "sittelle"] == 1))`
+occurrences ce qui est assez élevé pour la calibration des modèles.
+
+On va maintenant formater ces occurrences en combinant
+coordonnées et info sur l'occurrence dans un `data.frame` pour préparer la
+calibration de nos modèles
+
+```{r}
+P_points <- data.frame(
+  # D'abord on récupère les coordonnées XY qui correspondent à nos cellules de présences
+  coorXY[which(!is.na(env_sittelle_df[, "sittelle"])), ],
+  # Ensuite, on récupère la colonne qui indique présence pour chaque cellule
+  occurrence = env_sittelle_df[which(!is.na(env_sittelle_df[, "sittelle"])),
+                             "sittelle"])
+
+P_points
+```
+
+
+# Génération des points de background
+
+La littérature statistique récente suggère que les meilleures pratiques 
+consistent à générer un grand nombre de points de background (e.g., 10000)
+indépendamment de la localisation des points de présence (i.e., un point de 
+background peut être localisé au même endroit qu'un point de présence). Cela
+permet d'assurer une bonne représentation de l'ensemble des conditions 
+environnementales disponibles dans le modèle. Dans le cas de la Corse, le 
+nombre de points de background sera limité par le nombre de pixels disponibles :
+
+```{r}
+# Nous avons éliminé les données manquantes du tableau env_amphib_df
+# Par conséquent, son nombre de lignes est égal au nombre total de pixels 
+# disponibles sur la Corse
+nrow(env_sittelle_df)
+```
+
+Ainsi, nous fixerons le nombre de background par défaut à 10000 ce qui sera 
+suffisant pour
+une bonne calibration des modèles.
+Il n'est pas nécessaire de faire plusieurs répétitions, car le nombre de 
+points de background est déjà suffisamment élevé, les résultats de calibration
+ne varieraient pas entre différentes répétitions.
+
+
+Des tests préliminaires ont montré que la distance aux routes joue très 
+fortement sur les résultats des modèles. Voici une illustration de la 
+distribution des occurrences par rapport à la distance aux routes :
+
+```{r}
+# Illustration de l'effet de la distance aux routes
+dist_routes <- extract(env_corse[["distance_routes"]],
+                       P_points[, c("x", "y")])
+ggplot(dist_routes, aes(x = distance_routes)) +
+  geom_density()
+
+```
+
+La méthode la plus efficace pour gérer le biais d'échantillonnage dans les 
+modèles consiste à intégrer directement le 
+biais dans la génération des backgrounds ; ce qui est plus efficace que de 
+l'inclure en variable explicative.
+
+```{r, fig.height = 7, fig.width = 5}
+prob_distance_routes <- env_corse[["distance_routes"]]
+# Utilisation d'une exponentielle inverse pour la probabilité d'échantillonnage
+
+prob_distance_routes <- 
+  exp(-(prob_distance_routes / global(prob_distance_routes,
+                                      "max", na.rm = T)[1, 1] + 1)^2)
+
+# On réduit également le nombre de background pour avoir un effet du biais
+background <- spatSample(prob_distance_routes,
+                         method = "weights",
+                         size = 5000,
+                         replace = FALSE, # Pas de remise 
+                         na.rm = TRUE, # Pas dans les données manquantes
+                         xy = TRUE, # L'output inclut les coords XY
+                         values = FALSE) # L'output exclut les variables
+
+
+# On ajoute les points de background aux données de présence
+P_points <- rbind.data.frame(P_points,
+                             data.frame(background, 
+                                        occurrence = 0))
+
+```
+
+# Sélection des variables environnementales
+
+
+
+
+
+
+##  Climat
+
+La sittelle Corse dépend des conditions climatiques, notamment température et précipitations, pour sa survie et sa reproduction (Thibault et Villard 2005, Thibault et al. 2006). Cependant, la distribution actuelle de la sittelle Corse est probablement le reflet d'une contraction très importante d'aire de répartition à basse altitude liée à deux facteurs ; d'une part, la surexploitation de son habitat principal, le pin Laricio (Barbet-Massin et Jiguet 2011, Torre 2014), et d'autre part, l'augmentation des feux de forêts qui a favorisé la régénération du pin maritime (Guy, pers. comm. 2023).
+
+Ainsi, il est fort probable que la recherche d'une relation en analysant la corrélation entre le climat et la distribution actuelle de la sittelle Corse résulte en l'identification de réponses climatiques qui ne reflètent pas réellement la niche écologique de l'espèce. Par conséquent, les choix de variables climatiques que nous effectuerons pour modéliser l'habitat de la sitelle Corse seront seront avant tout contraint par l'objectif d'éviter de trouver des corrélations irréalistes dûes aux à la réduction anthropogénique de l'aire de répartition de l'espèce. Ainsi, nous partirons de l'hypothèse que la limite altitudinale inférieure de la sittelle est due à une réduction anthropogénique de l'habitat et non pas à un climat trop chaud et sec - nous n'incluerons donc pas de variables climatiques liées aux températures maximales et à la sécheresse. Par contre, il est probable que la limite altitudinale supérieure de la sittelle Corse soit effectivement dûe à des caractéristiques climatiques empêchant la survie ou le développement de l'espèce (e.g., accès aux graines de pin en hiver liées à l'ouverture des cônes selon la température extérieure, ONF 2016) ; nous utiliserons donc des variables reflétant les minimums de températures annuels en supposant un effet négatif des températures trop froides en hiver. Un facteur confondant pourrait néanmoins également exister pour la limite supérieure : la limite altitudinale haute du pin laricio était contrainte par le pâturage estival, et il est possible que l'abandon de cette pratique permet aujourd'hui une reconquête du pin en altitude (Guy, pers. comm. 2023). Il existera donc une incertitude sur la limite altitudinale supérieure.  
+
+
+Noms des variables retenues :
+
+ - Températures minimales (*bio6*)
+
+
+
+##  Occupation du sol
+
+Les travaux sur l'écologie de la sittelle Corse sont formels sur le fait que le pin Laricio constitue l'habitat de la sittelle ; ainsi la distribution des pins Laricio sera utilisée comme variable prédictive avec l'hypothèse qu'il s'agit du principal facteur expliquant la répartition de la sittelle Corse. Cependant, les travaux précédents ont montré que l'exploitation forestière et la nature des parcelles de pin Laricio (notamment la taille des arbres et la présence d'arbres morts) influencent fortement la présence ou non des sittelles ; mais ces informations ne sont pas disponibles dans les variables spatialisées. Ainsi, il est possible que la distribution connue des pins Laricio surestime la répartition réelle de la sittelle Corse. 
+
+Des données LIDAR sont en cours d'acquisition sur la nature des peuplements forestiers (Guy, pers. comm. 2023), ce qui permettra dans le futur d'intégrer une couche spatialisée indiquant la nature des peuplements forestiers, avec notamment la présence de gros bois. 
+
+Les feux de forêts pourraient influencer négativement la distribution de la sittelle Corse (Guy, pers. comm. 2023) - cependant il n'existe pas de variable environnementale spatialisée sur les feux de forêts dont l'intervalle temporal correspond aux données d'occurrence d'espèces, ce qui rend difficile l'inclusion de cette variable pour le moment. 
+
+
+Noms des variables retenues :
+
+ - Répartition du pin laricio (*laricio*)
+
+
+##  Biais d'échantillonnage
+
+La probabilité d'observer les espèces est souvent directement liée à l'accessibilité du milieu, qui est connue pour être fortement corrélée à la distance aux routes. Nous utiliserons donc la distance aux routes comme proxy du biais d'échantillonnage afin d'éviter que les modèles ne cherchent à expliquer l'accessibilité par les autres variables environnementales. Cependant, les échantillonnages récents (PNA sittelle de Corse 2017-2026, Guy, pers. comm. 2023) ont été planifiés pour éviter ce biais, et donc il est supposé que sur l'ensemble des échantillons l'effet de cette variable ne soit pas significatif. 
+
+Les données de présence-absence produites par Endemys ont été échantillonnées en minimisant ce biais  (Guy, pers. comm. 2023), avec notamment des points d’écoute ont été effectués loin des accès routiers. Cela permettra de tester la validité des modèles indépendamment du biais d'échantillonnage. 
+
+
+
+##  Variables anthropogéniques
+
+La principale perturbation pour les sittelles est le degré d'exploitation forestière qui limite la taille des arbres et la présence de bois mort, nécessaire à l'espèce. Nous utiliserons la variable d'intégrité biophysique des sols comme indicateur de la probabilité d'exploitation forestière, car l'exploitation forestière fait partie intégrante du calcul de de l'indice d'intégrité biophysique des sols (Guetté et al. 2021). 
+L'espèce ne semble pas sujette aux perturbations anthropiques hors régimes de feu et surexploitation forestière, à dire d'expert (Guy, pers. comm. 2023).
+
+Noms des variables retenues :
+
+ - Intégrité biophysique des sols (*integrite*)
+
+
+##  Autres variables et commentaires
+
+L'espèce est extrêmement territoriale et sédentaire. Il est probable que le territoire hivernal soit plus large que celui occupé en période de reproduction mais il reste probablement centré sur le territoire de reproduction, ainsi il n'est pas nécessaire de séparer les occurrences estivales et hivernales (Guy, pers. comm. 2023).
+
+
+
+## Constitution du jeu de variables finales pour la sittelle Corse
+
+### Préparation des rasters
+
+```{r}
+env_sittelle <- env_corse[[c("bio6",
+                             "laricio",
+                             "integrite")]]
+```
+
+
+### Etude de la colinéarité et réduction du nombre de variables
+
+On étudie la colinéarité entre les variables avec le coefficient de corrélation
+de Spearman (car certaines variables ne sont pas distribuées normalement), en utilisant un seuil standard de 0.7. 
+
+```{r fig.height = 10, fig.width = 10}
+var_groups <- removeCollinearity(env_sittelle,
+                                 plot = TRUE,
+                                 multicollinearity.cutoff = 0.7,
+                                 method = "spearman")
+```
+
+Il n'y a pas de colinéarité au seuil de 0.7 dans les données, et il n'y a que
+trois variables ce qui est bon pour les modèles.
+
+
+# Préparation de la stratégie de validation croisée des modèles
+
+Nous allons utiliser une procédure de validation croisée par bloc ce qui permet
+de réduire l'autocorrélation spatiale entre jeu de données de calibration et 
+jeu de validation. 
+
+## Définition de la taille des blocs
+
+Il faut étudier le degré d'autocorrélation spatiale dans les variables 
+environnementales pour avoir une idée de la taille des blocs. La taille des 
+blocs est un compromis entre la diminution de l'autocorrélation spatiale et les
+contraintes des données.
+
+```{r warning = FALSE}
+# Pour étudier la taille des blocs à viser, il faut d'abord projeter le raster
+env_sittelle_l93 <- project(env_sittelle,
+                               "EPSG:2154")
+
+# Ensuite on étudie le range d'autocorrélation spatiale
+AC_range <- cv_spatial_autocor(env_sittelle_l93)
+```
+
+On obtient un range médian qui est de `r AC_range$range`, ce qui est 
+satisfaisant ici pour réaliser une validation croisée par blocs : il y a 
+beaucoup de blocs, ce qui signifie que la répartition des blocs en plis sera 
+probablement bien équilibrée.
+
+```{r warning=FALSE,}
+P_points_sf <- st_as_sf(P_points, 
+                        coords = c("x", "y"), 
+                        crs = "EPSG:4326")
+
+plis_cv <- cv_spatial(x = P_points_sf,
+                      column = "occurrence", # Nom de la colonne des occurrences
+                      k = 5, # Nombre de plis (folds) pour la k-fold CV
+                      size = AC_range$range, # Taille des blocs en metres
+                      selection = "random", # Attribution des blocs aléatoire dans 
+                      # les plis
+                      iteration = 50, # Nombre d'essais pour trouver des plis
+                      # équilibrés
+                      biomod2 = TRUE, # Formater les données pour biomod2
+                      r = env_sittelle, # Pour le fond de carte
+                      progress = FALSE) 
+
+```
+
+On voit que nos plis sont plutôt bien équilibrés, avec environ 440 présences 
+en moyenne pour la calibration, et de environ 100 présences pour
+l'évaluation, ce qui est suffisant pour l'évaluation.
+
+
+Dernière étape, biomod2 exige un format particulier pour les plis de validation
+croisée, donc on va préparer ce format ici :
+
+```{r}
+table_cv <- plis_cv$biomod_table
+colnames(table_cv) <- paste0("_allData_", 
+                             colnames(table_cv))
+```
+
+
+# Calibration des modèles
+
+Tout d'abord on prépare les données pour biomod2.
+
+```{r}
+coorxy <- P_points[, c("x", "y")]
+occurrences <- P_points[, "occurrence"]
+
+
+dir.create("models/sittelle", recursive = T, showWarnings = FALSE)
+
+run_data <- BIOMOD_FormatingData(
+  resp.name = "sittelle", # Nom de l'espèce
+  resp.var = occurrences, # Présences + background
+  expl.var = env_sittelle, # Variables environnementales prédictives
+  dir.name = "models", # Dossier dans lequel on va stocker les modèles
+  resp.xy = coorxy, # Coordonnées xy des présences et background
+  PA.strategy = NULL) # Pas de génération de points de background par biomod
+# Car on en a généré nous-mêmes
+
+saveRDS(run_data, file = paste0("models/sittelle/run_data.RDS"))
+```
+Biomod nous indique deux choses : que nous n'avons pas de données indépendantes
+pour l'évaluation, ce qui est effectivement le cas à ce stade de l'étude.
+Par ailleurs, que plusieurs données peuvent être dans la même cellule, ce qui 
+est également attendu car nous avons tiré aléatoirement nos background dans
+toute la zone d'étude et donc ils ont pu tomber dans les mêmes cellules que des 
+points de présence. Pas d'inquiétudes, c'est ce que l'on avait prévu.
+
+On va pouvoir désormais préparer la calibration des modèles, en les paramétrant
+de manière correcte. Ce qui est important de savoir ici c'est que nos modèles
+vont avoir deux grosses difficultés statistiques :
+
+ - *déséquilibre des classes* : il y a au total
+ `r length(which(occurrences == 1))` présences et 10000 backgrounds (qui seront
+ considérés comme des valeurs de 0 par les modèles), ce qui crée un gros 
+ déséquilibre entre les 1 et les 0. C'est ce qu'on appelle le déséquilibre des
+ classes
+ 
+ - *chevauchement des classes* : il est probable que les présences et les
+ backgrounds se chevauchent sur les gradients de variables environnementales
+ (d'autant plus que nous pouvons avoir parfois une présence et un background
+ dans le même pixel), ce qui rend la distinction entre les 1 et les 0 difficile
+ pour les modèles. C'est ce qu'on appelle le chevauchement des classes
+ 
+La solution pour bien paramétrer les modèles face au déséquilibre et au
+chevauchement varie selon les modèles, mais le principe général est de réduire
+l'importance des backgrounds lors de la calibration par rapport au présence,
+afin de viser un ratio équilibre 50/50 entre importance des présences et 
+importance des backgrounds. Par exemple, on va attribuer des poids
+aux présences et aux backgrounds de sorte que la somme du poids des présences
+et des backgrounds soit égale. Cependant, cette méthode fonctionne mal sur 
+certains modèles comme le random forest, et il faut alors le paramétrer de 
+manière plus fine avec un rééchantillonnage à 50/50 en interne. 
+
+Par ailleurs, il est important de noter que l'évaluation des modèles avec la
+validation croisée n'est pas un élément validant la robustesse du modèle. Elle
+est plutôt à considérer comme un élément qui élimine les mauvais modèles, mais
+elle ne constitue pas une preuve de robustesse quand elle est bonne, car elle
+est limitée à la fois par la nature des données (présence-seule, pas 
+d'absences), et par la possibilité qu'il y ait des biais dans 
+l'échantillonnage. Ainsi, il est difficile d'utiliser la validation croisée
+pour identifier les meilleurs modèles ; il vaut mieux donc se baser sur des 
+paramètres établis pour être robustes en situation de présence-seule (e.g.,
+Valavi et al. 2021).
+ 
+Préparons donc la calibration de nos modèles :
+
+
+ 
+```{r warning=FALSE,message=FALSE}
+calib_summary <- 
+  summary(run_data, calib.lines =  table_cv) %>% 
+  filter(dataset == "calibration")
+
+iwp <- (10^6)^(1 - occurrences)
+
+
+RF_param_list <- NULL
+GLM_param_list <- NULL
+GBM_param_list <- NULL
+XGBOOST_param_list <- NULL
+XGBOOST_param_list <- NULL
+GAM_param_list <- NULL
+MARS_param_list <- NULL
+XGBOOST_param_list <- NULL
+for (cvrun in 1:nrow(calib_summary)) {
+  
+  prNum <- calib_summary$Presences[cvrun]
+  bgNum <- calib_summary$True_Absences[cvrun]
+
+  wt <- ifelse(occurrences == 1, 1, prNum / bgNum)
+
+  RF_param_list[[paste0("_",
+                        calib_summary$PA[[cvrun]],
+                        "_",
+                        calib_summary$run[[cvrun]])]] <-
+    list(ntree = 1000,
+         sampsize =  c("0" = prNum,
+                       "1" = prNum),
+         replace = TRUE)
+  
+  GLM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-
+    list(weights = wt)
+  
+  
+  GBM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-
+    list(interaction.depth = 5,
+         n.trees = 5000, 
+         shrinkage = 0.001,
+         bag.fraction = 0.75,
+         cv.folds = 5,
+         weights = wt)
+  
+  GAM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-     
+    list(weights = wt,
+         method = "REML")
+  
+  MARS_param_list[[paste0("_",
+                          calib_summary$PA[[cvrun]],
+                          "_",
+                          calib_summary$run[[cvrun]])]] <- 
+    list(weights = wt)
+  
+  XGBOOST_param_list[[paste0("_",
+                             calib_summary$PA[[cvrun]],
+                             "_",
+                             calib_summary$run[[cvrun]])]] <-
+    list(nrounds = 10000,
+         eta = 0.001,
+         max_depth = 5,
+         subsample = 0.75,
+         gamma = 0,
+         colsample_bytree = 0.8,
+         min_child_weight = 1,
+         weight = wt,
+         verbose = 0)
+}
+
+model_parameters <- bm_ModelingOptions(
+  data.type = "binary",
+  models = c("GLM", "GBM", "GAM.mgcv.gam", "MARS", "RF", "MAXNET", "XGBOOST"),
+  strategy = "user.defined",
+  user.base = "default",
+  user.val = list(
+    GLM.binary.stats.glm = GLM_param_list,
+    GBM.binary.gbm.gbm = GBM_param_list,
+    GAM.binary.mgcv.gam = GAM_param_list,
+    MARS.binary.earth.earth = MARS_param_list,
+    RF.binary.randomForest.randomForest = RF_param_list,
+    XGBOOST.binary.xgboost.xgboost = XGBOOST_param_list
+  ),
+  bm.format = run_data,
+  calib.lines = table_cv
+)
+
+
+
+```
+
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+model_runs <- BIOMOD_Modeling(
+  run_data,
+  modeling.id = "1", # ID de modélisation, on met 1 pour tous nos modèles ici
+  models = c("GLM", "GBM", "GAM", "MARS", # MARS éliminé ici car il plante
+             "MAXNET", "RF", "XGBOOST"),  # idem pour MAXNET 
+  OPT.strategy = "user.defined",
+  OPT.user = model_parameters, # Paramètres des modèles
+  CV.strategy = "user.defined", # Méthode de validation croisée
+  CV.user.table = table_cv, # Plis générés précéemment
+  CV.do.full.models = FALSE,
+  var.import = 10, # Nombre de répétitions d'importance des variables
+  metric.eval = "BOYCE",
+  do.progress = FALSE,
+  nb.cpu = 16 # Nombre de coeurs à utiliser pour la modélisation
+  # A ajuster selon votre ordinateur, ne pas en mettre trop !
+)
+saveRDS(model_runs, file = "models/sittelle/model_runs.RDS")
+```
+
+
+# Evaluation des modèles
+
+```{r}
+evals_boyce <- get_evaluations(model_runs)
+ggplot(evals_boyce, aes(x = algo, y = validation)) +
+  geom_point(aes(col = run))
+```
+
+# Importance des variables
+
+```{r}
+varimp <- get_variables_importance(model_runs)
+
+varimp$expl.var <- reorder(varimp$expl.var,
+                           varimp$var.imp,
+                           median,
+                           na.rm = TRUE)
+
+library(dplyr)
+
+varimp %>%
+  group_by(expl.var) %>%
+  summarise(median = median(var.imp))
+
+ggplot(varimp) + 
+  geom_boxplot(aes(x = expl.var, y = var.imp)) +
+  geom_jitter(aes(x = expl.var, y = var.imp, col = algo),
+              alpha = .3) +
+  coord_flip() +
+  theme_minimal()
+
+```
+
+
+# Courbes de réponse
+
+```{r, fig.height = 6, fig.width = 6, warning = FALSE}
+# Variables utilisées pour la calibration
+cur_vars <- model_runs@expl.var.names
+
+# Calcul des courbes de réponse
+resp <- bm_PlotResponseCurves(bm.out = model_runs,
+                              fixed.var = "mean",
+                              data_species = occurrences,
+                              do.plot = FALSE,
+                              do.progress = FALSE)$tab
+
+colnames(resp) <- c("Index", "Variable", "Var.value", "Model", "Response")
+
+for (model in c("GLM", "GBM", "GAM", "MARS", "MAXNET", 
+                "RF", "XGBOOST")) {
+  p <- ggplot(resp[grep(model, resp$Model), ], aes(x = Var.value, y = Response)) + 
+  geom_line(alpha = 0.2, aes(group = Model)) + 
+  stat_smooth() +
+  facet_wrap(~ Variable, scales = "free_x") + 
+  theme_bw() + 
+  ylim(0, 1.1) + 
+  xlab("Variable value") +
+    ggtitle(model)
+  
+  print(p)
+}
+
+
+```
+
+# Cartes
+
+```{r, fig.width = 6, fig.height = 3, message=FALSE, warning=FALSE, results='hide'}
+# On ne va garder que les modèles qui ont un indice de Boyce suffisamment élevé
+models_to_proj <- evals_boyce$full.name[which(evals_boyce$validation >= 0.8)]
+
+
+projection_runs <- BIOMOD_Projection(
+  bm.mod = model_runs, # Modèles calibrés
+  proj.name = "corse", # Nom de la projection actuelle
+  new.env = env_sittelle, # Données environnementales sur lesquelles on projette les modèles
+  models.chosen = models_to_proj, # Modèles à projeter
+  build.clamping.mask = TRUE, # Le clamping mask illustre les zones où les prédictions sont en dehors des valeurs
+  # utilisées lors de la calibration
+  nb.cpu = 4)
+
+cartes_individuelles <- rast("models/sittelle/proj_corse/proj_corse_sittelle.tif")
+
+
+# Rescaling des projections qui dépassent l'intervalle 0 - 1000
+cartes_individuelles[cartes_individuelles < 0] <- 0
+cartes_individuelles[cartes_individuelles > 1000] <- 1000
+
+for(i in 1:ceiling(nlyr(cartes_individuelles) / 2)) {
+  plot(cartes_individuelles[[(i * 2 - 1):
+                               min(nlyr(cartes_individuelles),
+                                   (i * 2))]], 
+       col = viridis::inferno(12))
+}
+
+
+```
+
+# Carte finale
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_finale <- mean(cartes_individuelles)
+plot(carte_finale, 
+     col = viridis::inferno(12))
+points(y ~ x, data = P_points[which(P_points$occurrence == 1), ],
+       pch = 16, cex = .4, 
+       col = "#21908CFF")
+```
+
+
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_incertitude <- app(cartes_individuelles, sd)
+ggplot() +
+  geom_spatraster(data = carte_incertitude) +
+  scale_fill_continuous(type = "viridis") +
+  ggtitle("Incertitude\n(écart-type des probabilités)")
+```
+
+
+## Carte de rendu, essai 1
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+favorabilite_presences <- extract(carte_finale,
+                                  P_points[which(P_points$occurrence == 1),
+                                           c("x", "y")],
+                                  ID = FALSE)
+boxplot(favorabilite_presences)
+qt_favorabilite <- quantile(favorabilite_presences$mean, probs = c(.10, .25))
+
+carte_indice <- carte_finale
+carte_indice[carte_finale < qt_favorabilite["10%"]] <- 0
+carte_indice[carte_finale >= qt_favorabilite["10%"] &
+               carte_finale < qt_favorabilite["25%"]] <- 1
+carte_indice[carte_finale >= qt_favorabilite["25%"]] <- 2
+
+carte_indice <- as.factor(carte_indice)
+
+
+ggplot() + 
+  geom_spatraster(data = carte_indice) +
+  scale_fill_manual(values = viridis::plasma(3),
+                    name = paste0("Favorabilité\n(% du total d'occurrences\n",
+                                  "observé dans cette classe\n",
+                                  "de favorabilité)"),
+                    labels = c("Faible ou méconnue (< 10%)",
+                               "Intermédiaire (10-25%)",
+                               "Elevée (75%)"),
+                    na.translate = F)
+
+```
+
+
+## Carte de rendu, essai 2
+
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+# Exploration d'un indice de densité de présences par classe de favorabilité
+fav <- values(carte_finale, data.frame = TRUE, na.rm = TRUE)
+species_fav <- extract(carte_finale,
+                       P_points[which(P_points$occurrence == 1),
+                                c("x", "y")],
+                       ID = FALSE)
+
+step = 1
+range = 50
+res <- NULL
+for (cur.int in seq(0, 950, by = step)) {
+
+  cur.int <- c(cur.int, cur.int + range)
+  
+  nb_cells <- length(which(fav[, 1] > cur.int[1] & fav[, 1] <= cur.int[2]))
+  
+  nb_occupied_cells <- length(which(species_fav[, 1] > cur.int[1] & 
+                                      species_fav[, 1] <= cur.int[2]))
+  res <- rbind(res,
+               data.frame(low = cur.int[1],
+                          high = cur.int[2],
+                          nb_occupied_cells = nb_occupied_cells,
+                          nb_cells = nb_cells,
+                          ratio = nb_occupied_cells / nb_cells))
+
+}
+
+res$ratio_presences <- res$nb_occupied_cells / sum(res$nb_occupied_cells)
+
+intermed_cutoff <- res[min(which(res$ratio > 0.05)), ] 
+high_cutoff <- res[min(which(res$ratio > 0.2)), ] 
+
+plot(res$ratio ~ res$high)
+abline(v = intermed_cutoff$low)
+abline(v = high_cutoff$low)
+plot(res$ratio_presences ~ res$high)
+abline(v = intermed_cutoff$low)
+abline(v = high_cutoff$low)
+
+carte_indice <- carte_finale
+carte_indice[carte_finale < intermed_cutoff$low] <- 0
+carte_indice[carte_finale >= intermed_cutoff$low &
+               carte_finale < high_cutoff$low] <- 1
+carte_indice[carte_finale >= high_cutoff$low] <- 2
+
+carte_indice <- as.factor(carte_indice)
+
+ggplot() + 
+  geom_spatraster(data = carte_indice) +
+  scale_fill_manual(values = viridis::plasma(3),
+                    name = "Favorabilité\n(% de cellules occupées)",
+                    labels = c("Faible ou méconnue (<5%)",
+                               "Intermédiaire (5-25%)",
+                               "Elevée (>25%)"),
+                    na.translate = F)
+
+```

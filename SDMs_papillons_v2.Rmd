@@ -1,0 +1,1141 @@
+---
+title: "Papillons"
+author: "Boris Leroy"
+date: "`r format(Sys.time(), '%d/%m/%y')`"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    toc: yes
+    df_print: paged
+---
+### *Note sur ce gabarit Rmarkdown*
+
+Copyright Boris Leroy, `r format(Sys.time(), '%y')`
+
+leroy.boris@gmail.com
+
+Ce fichier constitue un gabarit complet pour la modélisation des habitats 
+potentiels d'une espèce ou d'un groupe d'espèce. [**Il est fourni sous licence 
+libre CeCILL-C**.](https://cecill.info/licences.fr.html)
+
+
+Ce fichier est régi par la licence CeCILL-C soumise au droit français et
+respectant les principes de diffusion des logiciels libres. Vous pouvez
+utiliser, modifier et/ou redistribuer ce programme sous les conditions
+de la licence CeCILL-C telle que diffusée par le CEA, le CNRS et l'INRIA 
+sur le site "http://www.cecill.info".
+
+En contrepartie de l'accessibilité au code source et des droits de copie,
+de modification et de redistribution accordés par cette licence, il n'est
+offert aux utilisateurs qu'une garantie limitée.  Pour les mêmes raisons,
+seule une responsabilité restreinte pèse sur l'auteur du programme,  le
+titulaire des droits patrimoniaux et les concédants successifs.
+
+*La licence CeCILL-C implique une obligation de citation et de diffusion du code
+sous licence libre en cas de réutilisation.*
+
+Citation recommandée :
+**Leroy B**. 2024. Modélisation de l'habitat des groupes d'espèces sujettes aux
+plans nationaux d'action. Code source disponible sur https://www.borisleroy.com/sdms-pna-corse
+
+
+
+Il a été testé fonctionnel sur la version de R `r R.version.string`, avec les packages
+sf (`r packageVersion("sf")`), terra (`r packageVersion("terra")`), ggplot2 
+(`r packageVersion("ggplot2")`), scales (`r packageVersion("scales")`), egg 
+(`r packageVersion("egg")`), virtualspecies 
+(`r packageVersion("virtualspecies")`), blockCV 
+(`r packageVersion("blockCV")`), biomod2 (`r packageVersion("biomod2")`),
+dplyr (`r packageVersion("dplyr")`), tidyterra (`r packageVersion("tidyterra")`), viridis 
+(`r packageVersion("viridis")`). 
+
+Il est possible que des évolutions futures de packages (notamment, biomod2, qui 
+est sujet à de nombreuses évolutions en 2023 et 2024) rendent certaines parties
+du fichier non fonctionnelles, ce qui nécessitera de corriger le code.
+
+
+
+# Pré-requis :
+
+Chargement des packages et fonctions, chargement de données géographiques et
+des variables environnementales harmonisées
+
+```{r message=FALSE, warning=FALSE}
+library(sf)
+library(terra)
+library(ggplot2)
+library(scales)
+library(egg)
+library(virtualspecies)
+library(blockCV)
+library(biomod2)
+library(dplyr)
+library(viridis)
+library(tidyterra)
+source("scripts/functions.R")
+
+# Shapefile de la Corse
+corse <- st_read("data/corse.gpkg")
+# Données environnementales harmonisées
+env_corse <- rast("data/env_corse_total_sync.tif")
+```
+
+# Chargement et préparation des données d'occurrence
+
+```{r fig.height=3, fig.width=6, message=FALSE, warning=FALSE}
+papillons <- st_read("data/donnees_brutes/taxa/papillons.shp")
+papillons$species <- simplify_species_name(papillons$nom_valide)
+
+papillons <- papillons[, c("species", "x_centroid", "y_centroid",
+                             "date_fin")]
+colnames(papillons) <- c("species", "x", "y", "date", "geometry")
+
+# Dates d'échantillonnage
+papillons$year <- as.numeric(strtrim(papillons$date, 4))
+papillons$month <- as.numeric(substr(papillons$date, 6, 7))
+
+
+papillonscsv <- read.csv("data/donnees_brutes/taxa/records-2023-07-21_papillons.csv")
+
+# Données spatialement imprécises à retirer : nombre de points
+length(which(papillonscsv$precisionGeometrieMetres > 1000))
+
+papillonscsv <- papillonscsv[
+  -which(papillonscsv$precisionGeometrieMetres > 1000), ]
+
+
+# Elimination des occurrences trop imprécises
+papillonscsv <- papillonscsv[
+  -which(papillonscsv$precisionLocalisation %in% 
+           c("XY centroïde commune",
+             "XY centroïde ligne/polygone",
+             "pas de XY (département)")), ]
+
+papillonscsv <- st_as_sf(papillonscsv,
+                          wkt = "objetGeoWKT") # papillonscsv contient les 
+# coordonnées au format WKT dans la colonne "objetGeoWKT"
+papillonscsv <- papillonscsv[, c("nomScientifiqueRef", "longitude",
+                                   "latitude", "dateObservation", "annee", 
+                                   "mois")]
+# On renomme les colonnes 
+colnames(papillonscsv) <- c("species", "x", "y", "date", "year", 
+                             "month", "geometry")
+# On indique à sf quelle colonne renommée contient les coordonnées
+st_geometry(papillonscsv) <- "geometry"
+
+# On définit le système de coordonnées pour papillonscsv
+st_crs(papillonscsv) <- "EPSG:4326"
+
+papillons <- rbind(papillons[, c("species", "x", "y", "date", "year", 
+                             "month", "geometry")],
+                    papillonscsv)
+
+# Le groupe des papillons étant très disparate en termes d'écologie, on ne va 
+# garder que les espèces qui sont fréquemment trouvées ensemble
+
+papillons <- papillons[which(papillons$species %in%
+                               c("Papilio hospiton",
+                                 "Fabriciana elisa",
+                                 "Zygaena corsica")), ]
+
+
+# Visualisation de la temporalité des occurrences
+ggplot(papillons) +
+  geom_boxplot(aes(x = species,
+                   y = year))+ 
+  coord_flip() +
+  scale_y_continuous(breaks = breaks_pretty()) +
+  theme_minimal()
+```
+La plupart des espèces ont des données post-2000, sauf pour Satyrium w-album et Cupido alcetas.
+
+
+## Filtre temporel
+
+Il faut établir un filtre temporel pour éliminer les données imprécises, 
+sachant que l'objectif est de modéliser à une résolution assez fine, de l'ordre
+de 1km.
+Le champ `precision` est peu renseigné et donc peu utile ici, il nous faut donc
+poser une hypothèse sur les données qui sont imprécises. On peut considérer que
+les GPS ont commencé à être largement disponibles à partir de 1990, mais leur
+utilisation ne s'est généralisée qu'à partir des années 2000, notamment grâce
+à leur miniaturisation. Ainsi, on peut spéculer qu'avant les années 2000, les
+données étaient moins précisés car possiblement géolocalisées en utilisant des
+référentiels comme les lieu-dits ou les communes, tandis qu'à partir des années
+2000 la précision s'est améliorée grâce à la géolocalisation par satellite. 
+
+Le nombre de données supprimées en fixant un seuil à l'année 2000 est 
+limité :
+
+```{r fig.height=10, fig.width=6}
+# Les données avant 2000 représentent un % modéré du jeu de données : 
+100 * length(which(papillons$year < 2000)) / nrow(papillons)
+```
+
+La couverture temporelle sur l'année est plus importante à partir de 2010 environ :
+
+```{r fig.height=10, fig.width=10}
+ggplot(papillons) +
+  geom_boxplot(aes(x = species,
+                   y = month)) +
+  facet_wrap(~year) + 
+  coord_flip() +
+  scale_y_continuous(breaks = breaks_pretty()) +
+  theme_minimal()
+```
+
+L'emprise spatiale des données d'occurrence change de manière modérée
+avec ou sans les données pré-2000 :
+
+```{r fig.height=7, fig.width=10}
+
+p_papillons_all <- ggplot() +
+  geom_sf(data = corse) +
+  geom_sf(data = papillons, aes(col = year)) +
+  scale_color_continuous(type = "viridis") + 
+  theme_minimal(base_size = 15) +
+  ggtitle("Toutes données\npapillons")
+
+p_papillons_post2000 <- ggplot() +
+  geom_sf(data = corse) +
+  geom_sf(data = papillons[papillons$year >= 2000, ], aes(col = year)) +
+  scale_color_continuous(type = "viridis") + 
+  theme_minimal(base_size = 15) +
+  ggtitle("Données post-2000\npapillons")
+
+ggarrange(p_papillons_all,
+          p_papillons_post2000,
+          nrow = 1)
+```
+
+On pose donc l'hypothèse raisonnable qu'un filtre à 2000 va assurer une bonne 
+précision dans la localisation des occurrences sans perdre d'information
+critique sur la répartition des espèces.
+
+```{r}
+papillons <- papillons[which(papillons$year >= 2000), ]
+```
+
+## Rasterisation des occurrences
+
+L'objectif ici est de ne garder qu'une occurrence par cellule à la résolution 
+de nos variables environnementales afin d'éviter une forme extrême de
+pseudo-réplication. Par exemple, si dans une cellule donnée on a initialement
+30 observations de la même espèce, alors, après rasterisation, ces 30 
+observations ne compteront que comme une seule occurrence. Cette étape est
+indispensable car elle évite de donner aux modèles, par exemple, 30 fois la même
+valeur de température provenant d'une seule cellule. C'est ce qu'on appelle
+de la pseudo-réplication et c'est très problématique pour les domaines. 
+On s'attend donc à ce que cette étape réduise le nombre d'occurrences pour les
+modèles.
+
+```{r}
+# On rasterise les occurrences à la résolution de nos variables 
+# environnementales
+papillons_r <- rasterize(papillons, 
+                             env_corse)
+names(papillons_r) <- "papillons" # Attention il ne faut pas nommer
+# la couche "papillons" car il y a des variables qui s'appellent 
+# papillons
+
+plot(papillons_r)
+```
+
+
+On va ensuite éliminer les occurrences qui sont dans des zones sans 
+valeurs de variables environnementales (i.e., essentiellement en zones
+côtières).
+Pour cela on va combiner les variables
+environnementales avec les occurrences rasterisées dans un `data.frame`, et 
+supprimer les occurrences d'espèces qui tombent sur des données 
+environnementales manquantes
+
+```{r}
+# On crée un stack avec nos occurrences rasterisées et les variables env
+env_papillons <- c(env_corse,
+                       papillons_r)
+
+# On récupère les coordonnées XY de toutes les cellules, pour préparer nos
+# données finales
+coorXY <- xyFromCell(env_corse, 
+                     1:ncell(env_corse))
+# On transforme le raster en data.frame 
+env_papillons_df <- values(env_papillons)
+
+env_papillons_df[is.nan(env_papillons_df)] <- NA
+
+# On regarde le nombre d'occurrences pour lesquelles il y a des données 
+# manquantes : 
+length(which(is.na(env_papillons_df[, "bio1"]) & 
+               !is.na(env_papillons_df[, "papillons"])))
+```
+
+On va maintenant supprimer les cellules pour lesquelles on n'a pas de données
+environnementales. Pour cela on va utiliser la première variable
+environnementale ici, car les données manquantes sont toutes les mêmes
+entre toutes les variables environnementales (cf. script harmonisation des
+données).
+
+
+```{r}
+# On filtre d'abord sur l'objet qui contient les coordonnées
+coorXY <- coorXY[-which(is.na(env_papillons_df[, 1])), ]
+# Et ensuite sur le tableau avec variables env et présences d'espèces
+env_papillons_df <- env_papillons_df[which(!is.na(env_papillons_df[, 1])), ]
+
+# Comparaison du nombre d'occurrences :
+# Avant rasterisation
+nrow(papillons)
+
+# Après rasterisation et élimination des données env manquantes
+length(which(env_papillons_df[, "papillons"] == 1))
+```
+
+Il s'agit donc du nombre d'occurrences que l'on va pouvoir utiliser pour 
+calibrer nos modèles. Il y a 
+`r length(which(env_papillons_df[, "papillons"] == 1))`
+occurrences ce qui est assez élevé pour la calibration des modèles.
+
+On va maintenant formater ces occurrences en combinant
+coordonnées et info sur l'occurrence dans un `data.frame` pour préparer la
+calibration de nos modèles
+
+```{r}
+P_points <- data.frame(
+  # D'abord on récupère les coordonnées XY qui correspondent à nos cellules de présences
+  coorXY[which(!is.na(env_papillons_df[, "papillons"])), ],
+  # Ensuite, on récupère la colonne qui indique présence pour chaque cellule
+  occurrence = env_papillons_df[which(!is.na(env_papillons_df[, "papillons"])),
+                             "papillons"])
+
+P_points
+```
+
+
+# Génération des points de background
+
+Etant donné que nos observations sont des présences-seules, i.e. sans données
+d'absences, il nous faut générer des points de "background" pour pouvoir 
+calibrer les modèles. Ces points de backgrounds sont des données tirées dans
+toute la zone d'étude qui renseignent les modèles sur comment les variables
+environnementales sont distribuées dans la géographie. Ces points seront fournis
+aux modèles comme des 0, ce qui permettra aux modèles d'identifier quels 
+habitats apparaissent comme favorable parmi l'ensemble des habitats disponibles.
+Cependant, ces 0 ne sont pas interprétés comme des absences, et l'interprétation
+finale du modèle nécessitera des précautions particulières, comme par exemple
+ne pas considérer la valeur issue du modèle comme une "probabilité de présence" 
+; elle sera plutôt considérée comme un indice de favorabilité de l'habitat.
+
+La littérature statistique récente suggère que les meilleures pratiques 
+consistent à générer un grand nombre de points de background (e.g., 10000)
+indépendamment de la localisation des points de présence (i.e., un point de 
+background peut être localisé au même endroit qu'un point de présence). Cela
+permet d'assurer une bonne représentation de l'ensemble des conditions 
+environnementales disponibles dans le modèle. Dans le cas de la Corse, le 
+nombre de points de background sera limité par le nombre de pixels disponibles :
+
+```{r}
+# Nous avons éliminé les données manquantes du tableau env_amphib_df
+# Par conséquent, son nombre de lignes est égal au nombre total de pixels 
+# disponibles sur la Corse
+nrow(env_papillons_df)
+```
+
+Ainsi, nous partons sur un point de départ à 10000 backgrounds ce qui sera
+suffisant pour
+une bonne calibration des modèles.
+Il n'est pas nécessaire de faire plusieurs répétitions, car le nombre de 
+points de background est déjà suffisamment élevé, les résultats de calibration
+ne varieraient pas entre différentes répétitions.
+
+Biais d'échantillonnage et accessibilité :
+Les tests préliminaires n'ont pas révélé que les données d'occurrences étaient
+plus biaisées par la distance aux routes que si elles avaient été tirées 
+aléatoirement. Ainsi, en l'absence d'hypothèse plus forte, nous ne tenterons
+pas de corriger le biais d'échantillonnage. 
+
+```{r, fig.height = 10, fig.width = 6}
+background <- spatSample(env_corse,
+                         size = 10000,
+                         method = "random",
+                         replace = FALSE, # Pas de remise
+                         na.rm = TRUE, # Pas dans les données manquantes
+                         xy = TRUE, # L'output inclut les coords XY
+                         values = FALSE) # L'output exclut les variables
+
+
+# On ajoute les points de background aux données de présence
+P_points <- rbind.data.frame(P_points,
+                             data.frame(background, 
+                                        occurrence = 0))
+
+# Affichage des occurrences
+plot(P_points$y ~ P_points$x, pch = c(1, 16)[P_points$occurrence + 1], 
+     asp = 1, cex = .5,
+     xlab = "Longitude", ylab = "Latitude")
+```
+
+Les points de background sont les cercles blancs, et les occurrences sont
+les cercles pleins. 
+
+# Sélection des variables environnementales
+
+
+
+
+##  Climat
+
+De la même manière et avec le même raisonnement que pour les odonates, il est attendu un effet fort de la température et de l'humidité relative chez les papillons. De très nombreuses études existent sur l'importance de la température et de l'humidité sur le développement et l'activité des différents stades de vie des papillons, avec une forte variabilité dans les mesures écophysiologiques entre espèces. Il est ainsi difficile de formuler des hypothèses précises sur les réponses potentielles car il n'existe pas de travail de synthèse sur ces données actuellement. Par conséquent nous partirons sur le principe de la réponse typique des espèces à la température avec un seuil de développement minimal, un optimum et un seuil critique supérieur, en supposant également que les fortes températures soient limitantes avant que le seuil critique ne soit atteint (Evans et al. 2015). Ces effets seront explorés sur deux variables de température, les températures minimales et maximales annuelles. En outre, les espèces de ce groupe réalisant leur cycle l'été, nous utiliserons aussi une variable de température minimale pour la période estivale uniquement.
+
+En tant qu'alternative, les degrés-jours (i.e., somme des températures quotidiennes accumulées sur un an) sont fréquemment mentionnés comme étant des variables importantes pour le développement des papillons ; cependant sans connaître le seuil minimal de développement il parait difficile d'utiliser ce type de variable. Néanmoins, nous évaluerons si les degrés-jours au dessus de 10°C peuvent agir comme prédicteur des distributions de papillons - car les travaux écophysiologiques sur le seuil de développement minimum indiquent des valeurs de 7 à 10°C (e.g., Buckley et al. 2011).
+
+
+De la même manière que pour les odonates, l’humidité relative joue également probablement un rôle important pour éviter la dessication des organismes, en particulier aux fortes températures, même si ce type d’effet est simplement mentionné dans la littérature sans données spécifiques. Nous explorerons l’effet de l’humidité relative minimale en supposant un effet négatif en particulier dans les zones sujettes aux températures élevées (zones trop sèches). S’agissant d’espèces occupant des altitudes élevées, on peut également s’attendre à un effet d’une humidité excessive ou de zones couvertes par la neige. Nous explorerons donc un potentiel effet négatif de l’humidité maximale et du couvert neigeux.
+
+
+Noms des variables retenues :
+
+ - températures les plus chaudes (*bio5*) et les plus froides de l'année (*bio6*)
+ 
+ - températures les plus froides de la saison estivale (*tasmin_chiro*)
+ 
+ - degrés-jours au-dessus de 10°C (*gdd10*)
+ 
+ - humidité relative minimale (*cmi_mean*) et maximale (*cmi_max*) humidité relative de surface moyenne (*hurs_mean*)
+ 
+ - nombre de jours sous la neige (*scd*)
+
+
+
+
+##  Occupation du sol
+
+Ce groupe est composé d'espèces aux écologies variées, dont certaines sont endémiques de Corse, tandis que d'autres ont une répartition géographique très large. Les habitats de ces espèces semblent varier, couvrant milieux secs, prairies, lisières de forêts, ce qui rend leur caractérisation difficile. Pour essayer de les caractériser, nous utiliserons la végétation de type herbacée et arbustive, couvrant des milieux relativement ouvert. En parallèle, nous explorerons l'effet de la productivité primaire nette qui est un indicateur continu de l'architecture de la végétation, avec l'hypothèse que les papillons préfèrent des zones à productivité primaire intermédiaire, évitant les zones à végétation trop dense.
+
+On peut également poser l'hypothèse que l'intensification de l'usage des sols (agriculture, urbanisation) présente un effet négatif sur ce groupe, étant donné que plusieurs des espèces ont besoin de plantes hôtes spécifiques qui existent dans les milieux naturels. Ainsi, nous testerons l'effet de l'artificialisation des territoires avec l'indice de naturalité. 
+
+En parallèle, nous testerons l'effet de la diversité d'habitats avec l'hypothèse que plus le paysage est homogène, moins la zone est favorable aux papillons. 
+
+Noms des variables retenues :
+
+ - artificialisation (agricole, urbaine) des territoires (*naturalite*)
+ 
+ - homogénéité du paysage (*simpson_landscapediv*)
+ 
+ - végétation herbacée et arbustive (*vege_herb*)
+ 
+ - productivité primaire nette (*npp*)
+
+
+##  Biais d'échantillonnage
+
+La probabilité d'observer les espèces est souvent directement liée à l'accessibilité du milieu, qui est connue pour être fortement corrélée à la distance aux routes. 
+Néanmoins, dans le cas des papillons, des tests préliminaires n'ont pas montré
+d'effet évident de biais lié à la distance aux routes, et donc cet effet
+ne sera pas pris en compte ici.
+
+
+
+
+##  Variables anthropogéniques
+
+Pas d'autres variables avec une hypothèse forte a priori.
+
+##  Autres variables et commentaires
+
+Certains papillons du groupe sont connus pour utiliser les courants ascendants
+dans les montagnes, via un phénomène appelée "hill-topping" (OEC Corsica). 
+Ainsi, nous testerons l'effet du vent en supposant que les papillons occupent
+des zones sujettes à un minimum de vents. 
+
+
+Noms des variables retenues :
+
+ - Vitesse du vent mensualisée moyenne (*sfcWind_mean*)
+
+
+## Constitution du jeu de variables finales pour les papillons
+
+### Préparation des rasters
+
+Pour créer la variable d'habitat à végétation éparse à peu dense, nous combinons
+deux variables : les zones ouvertes avec la végétation de type herbacée :
+
+```{r}
+env_corse[["vegetation_ouverte"]] <-
+  env_corse[["zones_ouvertes"]] +
+  env_corse[["vege_herb"]]
+```
+
+Ensuite nous l'incluons dans le jeu de variables : 
+
+```{r}
+env_papillons <- env_corse[[c("bio5",
+                              "bio6",
+                              "tasmin_chiro",
+                              "hurs_mean",
+                              "gdd10",
+                              "cmi_min",
+                              "cmi_max",
+                              "scd",
+                              "simpson_landscapediv",
+                              "sfcWind_mean",
+                              "vegetation_ouverte",
+                              "npp")]]
+```
+
+
+
+L'habitat des papillons semblant être des zones à végétation faible 
+
+### Etude de la colinéarité et réduction du nombre de variables
+
+La colinéarité est la corrélation qui existe entre les variables 
+environnementales. Des variables colinéaires posent des problèmes pour la
+calibration de nombreux modèles statistiques, donc on s'assure toujours 
+d'éliminer les variables colinéaires avant de faire la calibration.
+
+On étudie la colinéarité entre les variables avec le coefficient de corrélation
+de Spearman (car certaines variables ne sont pas distribuées normalement), en utilisant un seuil standard de 0.7. 
+
+```{r fig.height = 10, fig.width = 10}
+var_groups <- removeCollinearity(env_papillons,
+                                 plot = TRUE,
+                                 multicollinearity.cutoff = 0.7,
+                                 method = "spearman")
+```
+
+Plusieurs variables sont corrélées :
+
+ - cmi_max et npp : des tests préliminaires ont démontré que npp expliquait
+ mieux la répartition des papillons
+ 
+ - gdd10, bio6 et tasmin_chiro : les papillons du groupe réalisant leur cycle
+ durant l'été, nous privilégierons tasmin_chiro. Cette hypothèse a également
+ été confirmée par des tests préliminaires
+
+### Filtrage des variables non informatives
+
+[Les analyses préliminaires](http://borisleroy.com/sdms_pna_corse/SDMs_papillons_v1.html) complétées par des tests supplémentaires ont confirmé qu'il était difficile de caractériser l'habitat de ce groupe. Au final, seul un jeu réduit
+de variables présente à la fois un effet sur les modèles et conduisent à des 
+modèles aux évaluations élevées : 
+
+```{r}
+
+env_papillons <- env_corse[[c("bio5",
+                              "tasmin_chiro",
+                              "vegetation_ouverte",
+                              "sfcWind_mean",
+                              "npp",
+                              "hurs_mean")]]
+```
+
+
+
+# Préparation de la stratégie de validation croisée des modèles
+
+
+Nous ne disposons pas de jeu de données indépendant pour évaluer les modèles.
+Par conséquent, il nous faut utiliser une procédure de "validation croisée" qui
+consiste à séparer le jeu de données en deux, une partie sert à la calibration
+des modèles, et l'autre partie sert à l'évaluation. L'approche classique 
+consiste à faire de découpage de manière aléatoire, mais il a été démontré qu'un
+découpage aléatoire est suroptimiste car les points de données de calibration
+sont très proches, spatialement, des points de données d'évaluation.
+
+Pour éviter ce problème de proximité spatiale, nous allons utiliser une
+procédure dite de "validation croisée spatiale par blocs". Cette validation 
+croisée par blocs vise à réduire l'autocorrélation spatiale entre jeu de données 
+de calibration et jeu de validation. L'autocorrélation spatiale est le fait que
+des points proches dans l'espace ont des valeurs de variables environnementales
+similaires. Eviter l'autocorrélation spatiale entre jeu de calibration et 
+d'évaluation revient à éviter que les valeurs de variables environnementales
+soient similaires entre calibration et évaluation - cela permet de mieux tester
+la réelle capacité des modèles à prédire l'habitat favorable aux espèces.
+
+
+La démarche de validation croisée par blocs est la suivante :
+
+1. Définir une taille de blocs qui réduit l'autocorrélation spatiale entre
+calibration et évaluation
+
+2. Répartir les blocs en plis ("folds") de calibration et d'évaluation
+
+3. Vérifier que les plis sont équilibrés, i.e. le nombre de points de 
+calibration doit être similaire entre les plis. Si les plis sont déséquilibrés,
+recommencer les étapes 1-3 en réduisant la taille des blocs. 
+
+
+## Définition de la taille des blocs
+
+Il faut étudier le degré d'autocorrélation spatiale dans les variables 
+environnementales pour avoir une idée de la taille des blocs. La taille des
+blocs est un compromis entre l'objectif de diminution de l'autocorrélation 
+spatiale et les contraintes des données d'occurrences. En effet, si toutes
+les occurrences sont localisées dans une petite zone, il ne sera pas possible de
+viser des blocs trop grands, car on ne pourrait alors pas séparer les points en 
+jeu de calibration et jeu d'évaluation.
+
+
+```{r warning = FALSE}
+# Pour étudier la taille des blocs à viser, il faut d'abord projeter le raster
+# en mètres, sinon la fonction de calcul de l'autocorrélation échouera
+env_papillons_l93 <- project(env_papillons,
+                               "EPSG:2154") # Projection en Lambert 93 ici
+
+# Ensuite on étudie le range d'autocorrélation spatiale
+AC_range <- cv_spatial_autocor(env_papillons_l93,
+                               num_sample = 10000)
+```
+
+On obtient initialement un range médian qui est de 
+`r round(AC_range$range / 1000, 1)` km, ce qui 
+est 
+satisfaisant ici pour réaliser une validation croisée par blocs : il y a 
+beaucoup de blocs, ce qui signifie que la répartition des blocs en plis sera 
+probablement bien équilibrée.
+
+```{r warning=FALSE}
+P_points_sf <- st_as_sf(P_points, 
+                        coords = c("x", "y"), 
+                        crs = "EPSG:4326")
+
+plis_cv <- cv_spatial(x = P_points_sf,
+                      column = "occurrence", # Nom de la colonne des occurrences
+                      k = 6, # Nombre de plis (folds) pour la k-fold CV
+                      size = AC_range$range, # Taille des blocs en metres
+                      selection = "random", # Attribution des blocs aléatoire dans 
+                      # les plis
+                      iteration = 50, # Nombre d'essais pour trouver des plis
+                      # équilibrés
+                      biomod2 = TRUE, # Formater les données pour biomod2
+                      r = env_papillons, # Pour le fond de carte
+                      progress = FALSE,
+                      plot = FALSE)
+
+```
+
+
+On voit que nos plis sont plutôt 
+`r ifelse(max((plis_cv$records$train_1 - median(plis_cv$records$train_1)) / median(plis_cv$records$train_1)) > 0.3, "déséquilibrés", "équilibrés")` :
+								  
+
+ - de `r min(plis_cv$records$train_1)` à `r max(plis_cv$records$train_1)` présences pour la calibration
+ 
+ - de `r min(plis_cv$records$test_1)` à `r max(plis_cv$records$test_1)` présences pour 
+l'évaluation
+
+On peut visualiser la répartition des points de calibration ("Train") et 
+évaluation ("Test") pour chaque pli sur la carte suivante : 
+
+```{r warning=FALSE,}
+cv_plot(plis_cv, x = P_points_sf)
+```
+
+Cette carte inclut à la fois les présences et les backgrounds.
+
+
+Dernière étape, biomod2 exige un format particulier pour les plis de validation
+croisée, donc on va préparer ce format ici :
+
+```{r}
+table_cv <- plis_cv$biomod_table
+colnames(table_cv) <- paste0("_allData_", 
+                             colnames(table_cv))
+```
+
+
+# Calibration des modèles
+
+Tout d'abord on prépare les données pour biomod2.
+
+```{r}
+coorxy <- P_points[, c("x", "y")]
+occurrences <- P_points[, "occurrence"]
+
+
+dir.create("models/papillons", recursive = T, showWarnings = FALSE)
+
+run_data <- BIOMOD_FormatingData(
+  resp.name = "papillons", # Nom de l'espèce
+  resp.var = occurrences, # Présences + background
+  expl.var = env_papillons, # Variables environnementales prédictives
+  dir.name = "models", # Dossier dans lequel on va stocker les modèles
+  resp.xy = coorxy, # Coordonnées xy des présences et background
+  PA.strategy = NULL) # Pas de génération de points de background par biomod
+# Car on en a généré nous-mêmes
+
+saveRDS(run_data, file = paste0("models/papillons/run_data.RDS"))
+```
+Biomod nous indique deux choses : que nous n'avons pas de données indépendantes
+pour l'évaluation, ce qui est effectivement le cas à ce stade de l'étude.
+Par ailleurs, que plusieurs données peuvent être dans la même cellule, ce qui 
+est également attendu car nous avons tiré aléatoirement nos background dans
+toute la zone d'étude et donc ils ont pu tomber dans les mêmes cellules que des 
+points de présence. Pas d'inquiétudes, c'est ce que l'on avait prévu.
+
+On va pouvoir désormais préparer la calibration des modèles, en les paramétrant
+de manière correcte. Ce qui est important de savoir ici c'est que nos modèles
+vont avoir deux grosses difficultés statistiques :
+
+ - *déséquilibre des classes* : il y a au total
+ `r length(which(occurrences == 1))` présences et 
+  `r length(which(occurrences == 0))` backgrounds (qui seront
+ considérés comme des valeurs de 0 par les modèles), ce qui crée un gros 
+ déséquilibre entre les 1 et les 0. C'est ce que l'on appelle le déséquilibre
+ des classes.
+ 
+ - *chevauchement des classes* : il est probable que les présences et les
+ backgrounds se chevauchent sur les gradients de variables environnementales
+ (d'autant plus que nous pouvons avoir parfois une présence et un background
+ dans le même pixel), ce qui rend la distinction entre les 1 et les 0 difficile
+ pour les modèles. C'est ce que l'on appelle le chevauchement des classes.
+ 
+La solution pour bien paramétrer les modèles face au déséquilibre et au
+chevauchement varie selon les modèles, mais le principe général est de réduire
+l'importance des backgrounds lors de la calibration par rapport au présence,
+afin de viser un ratio équilibre 50/50 entre importance des présences et 
+importance des backgrounds. Par exemple, on va attribuer des poids
+aux présences et aux backgrounds de sorte que la somme du poids des présences
+et des backgrounds soit égale. Cependant, cette méthode fonctionne mal sur 
+certains modèles comme le random forest, et il faut alors le paramétrer de 
+manière plus fine avec un rééchantillonnage à 50/50 en interne. 
+
+Par ailleurs, il est important de noter que l'évaluation des modèles avec la
+validation croisée n'est pas un élément validant la robustesse du modèle. Elle
+est plutôt à considérer comme un élément qui élimine les mauvais modèles, mais
+elle ne constitue pas une preuve de robustesse quand elle est bonne, car elle
+est limitée à la fois par la nature des données (présence-seule, pas 
+d'absences), et par la possibilité qu'il y ait des biais dans 
+l'échantillonnage. Ainsi, il est difficile d'utiliser la validation croisée
+pour identifier les meilleurs modèles ; il vaut mieux donc se baser sur des 
+paramètres établis pour être robustes en situation de présence-seule (e.g.,
+Valavi et al. 2021).
+ 
+Préparons donc la calibration de nos modèles :
+
+
+ 
+```{r warning=FALSE,message=FALSE}
+calib_summary <- 
+  summary(run_data, calib.lines =  table_cv) %>% 
+  filter(dataset == "calibration")
+
+iwp <- (10^6)^(1 - occurrences)
+
+
+RF_param_list <- NULL
+GLM_param_list <- NULL
+GBM_param_list <- NULL
+XGBOOST_param_list <- NULL
+XGBOOST_param_list <- NULL
+GAM_param_list <- NULL
+MARS_param_list <- NULL
+XGBOOST_param_list <- NULL
+for (cvrun in 1:nrow(calib_summary)) {
+  
+  prNum <- calib_summary$Presences[cvrun]
+  bgNum <- calib_summary$True_Absences[cvrun]
+
+  wt <- ifelse(occurrences == 1, 1, prNum / bgNum)
+
+  RF_param_list[[paste0("_",
+                        calib_summary$PA[[cvrun]],
+                        "_",
+                        calib_summary$run[[cvrun]])]] <-
+    list(ntree = 1000,
+         sampsize =  c("0" = prNum,
+                       "1" = prNum),
+         replace = TRUE)
+  
+  GLM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-
+    list(weights = wt)
+  
+  
+  GBM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-
+    list(interaction.depth = 5,
+         n.trees = 5000, 
+         shrinkage = 0.001,
+         bag.fraction = 0.75,
+         cv.folds = 5,
+         weights = wt)
+  
+  GAM_param_list[[paste0("_",
+                         calib_summary$PA[[cvrun]],
+                         "_",
+                         calib_summary$run[[cvrun]])]] <-     
+    list(weights = wt)
+  
+  MARS_param_list[[paste0("_",
+                          calib_summary$PA[[cvrun]],
+                          "_",
+                          calib_summary$run[[cvrun]])]] <- 
+    list(weights = wt)
+  
+  XGBOOST_param_list[[paste0("_",
+                             calib_summary$PA[[cvrun]],
+                             "_",
+                             calib_summary$run[[cvrun]])]] <-
+    list(nrounds = 10000,
+         eta = 0.001,
+         max_depth = 5,
+         subsample = 0.75,
+         gamma = 0,
+         colsample_bytree = 0.8,
+         min_child_weight = 1,
+         weight = wt,
+         verbose = 0)
+}
+
+model_parameters <- bm_ModelingOptions(
+  data.type = "binary",
+  models = c("RF", "GLM", "GBM", "GAM.gam.gam", "MARS", "MAXNET", "XGBOOST"),
+  strategy = "user.defined",
+  user.base = "default",
+  user.val = list(
+    GLM.binary.stats.glm = GLM_param_list,
+    GBM.binary.gbm.gbm = GBM_param_list,
+    GAM.binary.mgcv.gam = GAM_param_list,
+    MARS.binary.earth.earth = MARS_param_list,
+    RF.binary.randomForest.randomForest = RF_param_list,
+    XGBOOST.binary.xgboost.xgboost = XGBOOST_param_list
+  ),
+  bm.format = run_data,
+  calib.lines = table_cv
+)
+
+
+
+```
+
+L'étape précédente sert à définir des paramètres appropriés pour tous les 
+modèles ; cependant, nous n'allons pas utiliser tous les modèles. Nous allons
+maintenant sélectionner les modèles qui seront effectivement lancés. Ce choix
+est basé sur les tests préliminaires qui ont mis en évidence les modèles 
+donnant des résultats cohérents, par rapport aux modèles ne donnant pas des
+résultats cohérents :
+
+
+ - les modèles GLM, MARS et MAXNET donnaient des réponses biologiquement 
+ irréalistes en U 
+ 
+ - le modèle GAM donnait des réponses linéaires monotones pour 
+ - le modèle XGBOOST présentait un fort défaut de surajustement
+ 
+ toutes les variables, alors que la plupart des autres modèles donnaient 
+ des réponses non linéaires
+ 
+ 
+Au final, seul les modèles random forest et GBM donnaient des réponses biologiquement cohérentes, ce sera donc les seuls modèles retenus pour ce groupe.
+ 
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+model_list <- c("RF", "GBM")
+```
+
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+model_runs <- BIOMOD_Modeling(
+  run_data,
+  modeling.id = "1", # ID de modélisation, on met 1 pour tous nos modèles ici
+  models = model_list, # Liste des modèles finaux à faire tourner
+  OPT.strategy = "user.defined",
+  OPT.user = model_parameters, # Paramètres des modèles
+  CV.strategy = "user.defined", # Méthode de validation croisée
+  CV.user.table = table_cv, # Plis générés précéemment
+  CV.do.full.models = FALSE,
+  var.import = 10, # Nombre de répétitions d'importance des variables
+  metric.eval = "BOYCE",
+  do.progress = FALSE,
+  nb.cpu = 16 # Nombre de coeurs à utiliser pour la modélisation
+  # A ajuster selon votre ordinateur, ne pas en mettre trop !
+)
+saveRDS(model_runs, file = "models/papillons/model_runs.RDS")
+```
+
+
+# Evaluation des modèles
+
+```{r}
+evals_boyce <- get_evaluations(model_runs)
+ggplot(evals_boyce, aes(x = algo, y = validation)) + 
+  geom_point(aes(col = run)) +
+  xlab("Algorithme") +
+  ylab("Indice de Boyce") +
+  labs(col = "Plis de\nvalidation\ncroisée") +
+  ylim(0, 1) +
+  theme_minimal()
+```
+
+L'indice de Boyce est un indice qui varie entre -1 et 1 (-1 = prédictions
+opposées à la réalité, 0 = prédiction nulles, 1 = prédictions parfaites). Ici,
+l'indice suggère des évaluations élevées pour tous les 
+modèles, ce qui est encourageant : aucun modèle n'a échoué à prédire les
+occurrences qui n'ont pas servi à la calibration.
+
+Il faut néamoins toujours être prudent sur l'interprétation des métriques 
+d'évaluation car il s'agit de modèles corrélatifs et parce que l'évaluation est
+effectuée sur les données d'occurrence qui peuvent être biaisées. Ces métriques
+nous indiquent principalement qu'aucun modèle n'a donné de très mauvais 
+résultats, c'est l'information à en retirer. En revanche, il faut se garder
+de la fausse impression de robustesse que peuvent donner de bonnes métriques,
+car les modèles peuvent faire de bonnes prédictions avec des variables qui
+n'ont pas de sens pour la biologie des espèces. La prochaine étape consiste 
+donc à étudier les réponses des espèces aux variables environnementales.
+
+
+# Importance des variables et courbes de réponse
+
+```{r}
+varimp <- get_variables_importance(model_runs)
+
+varimp$expl.var <- reorder(varimp$expl.var,
+                           varimp$var.imp,
+                           median,
+                           na.rm = TRUE)
+
+library(dplyr)
+
+varimp %>%
+  group_by(expl.var) %>%
+  summarise(median = median(var.imp))
+
+ggplot(varimp) + 
+  geom_boxplot(aes(x = expl.var, y = var.imp)) +
+  geom_jitter(aes(x = expl.var, y = var.imp, col = algo),
+              alpha = .3) +
+  coord_flip() +
+  theme_minimal() +
+  xlab("Variable prédictive") +
+  ylab("Importance des variables") +
+  labs(col = "Algorithme")
+
+```
+
+
+
+```{r, fig.height = 6, fig.width = 6, warning = FALSE}
+# Variables utilisées pour la calibration
+cur_vars <- model_runs@expl.var.names
+
+# Calcul des courbes de réponse
+resp <- bm_PlotResponseCurves(bm.out = model_runs,
+                              fixed.var = "mean",
+                              data_species = occurrences,
+                              do.plot = FALSE,
+                              do.progress = FALSE)$tab
+
+colnames(resp) <- c("Index", "Variable", "Var.value", "Model", "Response")
+
+
+for (model in model_list) {
+  p <- ggplot(resp[grep(model, resp$Model), ], aes(x = Var.value, y = Response)) + 
+    geom_line(alpha = 0.2, aes(group = Model)) + 
+    stat_smooth() +
+    facet_wrap(~ Variable, scales = "free_x") + 
+    theme_bw() + 
+    ylim(0, 1.1) + 
+    xlab("Valeurs des variables") +
+    ylab("Réponse") +
+    ggtitle(model)
+  
+  print(p)
+}
+
+
+```
+
+*Note: la courbe bleue est une aide pour visualiser la tendance, mais la vraie réponse des modèles correspond aux courbes grises*
+
+La variable la plus importante pour expliquer la répartition des papillons est la température de la saison estivale, avec une préférence pour des zones plutôt fraîches durant la saison estivale (température minimale estivale < 10°C). Les autres variables climatiques ont un effet plus faible, avec une préférence pour des températures maximales pas trop chaudes et une légère préférence pour une humidité de surface moyenne élevée. 
+
+Les régimes de vents moyens semblent également jouer un rôle important, les modèles suggérant une préférence pour les zones avec un minimum de vents, ce qui correspond à notre hypothèse initiale sur le comportement de hilltopping. Cependant, cette hypothèse reste spéculative, car l’effet du vent sur les papillons n’est pas bien établi, les espèces ayant des réponses très variées (Rosin et al., 2012), en particulier sur le comportement de hilltopping (Pe’er et al., 2004). Ainsi, il est possible que la réponse observée aux régimes de vents reflète en réalité une corrélation avec la topographie que les papillons utilisent pour identifier les lieux de reproduction. 
+
+En ce qui concerne le type de végétation occupée, les papillons semblent préférentiellement occuper des zones à végétation ouverte à productivité faible à intermédiaire, ce qui correspond relativement bien aux attendus (e.g. maquis montagnard). 
+
+# Cartes
+
+```{r, fig.width = 6, fig.height = 3, message=FALSE, warning=FALSE, results='hide'}
+# On ne va garder que les modèles qui ont un indice de Boyce suffisamment élevé
+models_to_proj <- evals_boyce$full.name[which(evals_boyce$validation >= 0.75)]
+
+
+projection_runs <- BIOMOD_Projection(
+  bm.mod = model_runs, # Modèles calibrés
+  proj.name = "corse", # Nom de la projection actuelle
+  new.env = env_papillons, # Données environnementales sur lesquelles on projette les modèles
+  models.chosen = models_to_proj, # Modèles à projeter
+  build.clamping.mask = TRUE, # Le clamping mask illustre les zones où les prédictions sont en dehors des valeurs
+  # utilisées lors de la calibration
+  nb.cpu = 4)
+
+cartes_individuelles <- rast("models/papillons/proj_corse/proj_corse_papillons.tif")
+
+
+# Rescaling des projections qui dépassent l'intervalle 0 - 1000
+cartes_individuelles[cartes_individuelles < 0] <- 0
+cartes_individuelles[cartes_individuelles > 1000] <- 1000
+
+for(i in 1:ceiling(nlyr(cartes_individuelles) / 2)) {
+  plot(cartes_individuelles[[(i * 2 - 1):
+                               min(nlyr(cartes_individuelles),
+                                   (i * 2))]], 
+       col = viridis::inferno(12))
+}
+
+
+```
+
+On observe une certaine variabilité entre les cartes qui reflètent l'inclusion
+ou l'exclusion de certaines zones d'occurrence dans les plus de validation
+croisée. 
+
+# Carte finale
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_finale <- mean(cartes_individuelles)
+ggplot() +
+  geom_spatraster(data = carte_finale) +
+  scale_fill_viridis(option = "inferno") +
+  geom_point(data =  P_points[which(P_points$occurrence == 1), ],
+             aes(x = x, y = y),
+             shape = 21,
+             fill = "#21908CFF",
+             col = "white",
+             size = 1) +
+  ggtitle("Indice de favorabilité final") +
+  xlab("Longitude") + 
+  ylab("Latitude") +
+  theme_minimal()
+```
+
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_incertitude <- app(cartes_individuelles, sd)
+ggplot() +
+  geom_spatraster(data = carte_incertitude) +
+  scale_fill_continuous(type = "viridis") +
+  ggtitle("Incertitude\n(écart-type des probabilités)") +
+  theme_minimal()
+```
+
+La carte de l’indice de favorabilité final représente essentiellement les zones montagnardes contenant la majorité des occurrences du groupe. Elle reflète donc bien les principaux habitats occupés par ces espèces de papillons, avec une très forte favorabilité dans toutes les zones d’altitude de l’île. Néanmoins, on note la présence d’occurrence à basse altitude qui sont localisées dans des zones à favorabilité intermédiaire, et donc plus difficiles à prédire par les modèles. Il est difficile de spéculer sur ces occurrences en l’absence d’informations supplémentaires : il peut s’agir d’une limite des modèles, qui ne parviennent pas bien à prédire ces zones par manque de données, ou bien d’observations accidentelles. Pour résoudre ces inconnues, il faudrait compléter l’effort de prospection pour comprendre la nature des occurrences localisées en basse altitude. Peut-être faudrait-il davantage modifier la composition du groupe d’espèces car il contient actuellement deux espèces dominantes (Papilio hospiton et Fabriciana elisa) et une espèce avec peu d’occurrences (Zygaena corsica). 
+
+Une critique formulée par l’expert consulté est que cette carte omet de nombreuses espèces à enjeux localisées en basse altitude, ce qui indique qu’elle n’est pas représentative de l’ensemble des enjeux du groupe des papillons de jour. 
+
+La carte d’incertitude illustre deux types d’incertitude : d’une part, une incertitude ponctuellement très élevée dans pour certaines occurrences localisées plutôt en basse altitude, illustrant les difficultés évoquées précédemment ; d’autre part, une incertitude notable dans les zones à favorabilité intermédiaire qui sont difficiles à prédire avec précision par ce type de modèles. 
+
+
+## Carte de potentiel d'habitat
+
+
+Pour créer la carte de potentiel d'habitat final, nous allons représenter 
+trois catégories de potentiel d'habitat, en respectant les contraintes 
+d'interprétation sur les modèles en présence seule. En effet, les modèles en
+présence seule ne peuvent pas fournir d'information sur la probabilité de
+présence. Par conséquent, ils ne peuvent informer sur les habitats défavorables 
+- ils informent seulement sur les habitats favorables compte-tenu des 
+connaissances actuelles.
+
+Ainsi, nous ne produirons pas de carte binaire "présence-absence" qui n'aurait
+pas de sens dans le cadre des modèles en présence-seule et qui est également une
+sur-simplification de la réalité biologique, qui n'est jamais binaire.
+Nous allons plutôt
+représenter trois catégories : 
+
+ - les zones à fort potentiel d'habitat
+ - les zones à potentiel d'habitat intermédiaire 
+ - les zones à potentiel d'habitat faible ou méconnu
+ 
+Pour établir une méthode permettant de définir ces trois catégories, on peut
+étudier comment les occurrences sont réparties sur le gradient de favorabilité
+des modèles. On peut alors utiliser les quantiles des occurrences pour 
+identifier les seuils séparant les catégories.
+
+
+```{r, fig.width = 6, fig.height = 2, message = FALSE}
+favorabilite_presences <- extract(carte_finale,
+                                  P_points[which(P_points$occurrence == 1),
+                                           c("x", "y")],
+                                  ID = FALSE)
+
+qt_favorabilite <- quantile(favorabilite_presences$mean, probs = c(.05, .25))
+
+
+ggplot(favorabilite_presences) +
+  geom_boxplot(aes(x = mean),
+               col = "darkgrey") +
+  geom_vline(xintercept = qt_favorabilite,
+             col = c("#1b9e77", "#7570b3"),
+             linetype = 2,
+             linewidth = 2) +
+  theme_minimal() +
+  xlab("Indice de favorabilité") +
+  scale_y_continuous(breaks = 0,
+                     labels = "Occurrences") +
+  xlim(0, 1000)
+```
+Dans le graphe ci-dessus, on voit la répartition des occurrences sur l'indice
+de favorabilité produit par le modèle. On peut utiliser les quantiles à 5% et 
+25% (représentés par les pointillés bleus) pour séparer les catégories. 
+
+ - La zone à droite du quantile à 25% (le trait mauve) contient l'essentiel des 
+ occurrences du groupe d'espèces, ce qui signifie qu'au delà de ce seuil, 
+ le **potentiel d'habitat est élevé**. 
+
+ - La zone entre le quantile à 5% (trait vert) et à 25% (trait mauve) est une
+ zone à favorabilité plus faible mais qui contient tout de même 20% des 
+ occurrences du groupe. On peut ainsi la caractériser comme **zone à potentiel
+ d'habitat intermédiaire**. 
+ 
+ - La zone à gauche du quantile à 5% (trait vert) contient moins de 5% des
+ occurrences du groupe. Il s'agit donc de valeurs de favorabilité plutôt faibles
+ puisqu'elles ne semblent pas ou peu occupées d'après les connaissances 
+ actuelles. On peut donc qualifier cette catégorie de **potentiel d'habitat 
+ faible ou méconnu**.
+ 
+ Si l'on utilise ces seuils pour illustrer la répartition de ces trois 
+ catégories, on obtient la carte suivante :
+
+```{r, fig.width = 6, fig.height = 6, message = FALSE}
+carte_indice <- carte_finale
+carte_indice[carte_finale < qt_favorabilite["5%"]] <- 0
+carte_indice[carte_finale >= qt_favorabilite["5%"] &
+               carte_finale < qt_favorabilite["25%"]] <- 1
+carte_indice[carte_finale >= qt_favorabilite["25%"]] <- 2
+
+carte_indice <- as.factor(carte_indice)
+
+ggplot() + 
+  geom_spatraster(data = carte_indice) +
+  scale_fill_manual(values = viridis::plasma(3),
+                    name = paste0("Potentiel dd'habitat\n(% du total",
+                                  "d'occurrences\n",
+                                  "observé dans cette classe\n",
+                                  "de favorabilité)"),
+                    labels = c("Faible ou méconnu (< 5%)",
+                               "Intermédiaire (5-25%)",
+                               "Elevé (75%)"),
+                    na.translate = F)
+
+```
+
+La carte du potentiel d’habitat illustre les zones à fort potentiel d’habitat essentiellement en montagne, qui concentrent l’essentiel des observations connues (les zones en jaune contiennent 75% du total des occurrences du groupe). Les zones à potentiel d’habitat intermédiaire possèdent un indice de favorabilité plus faible, mais qui concentrent malgré tout 20% des observations connues du groupe, et sont localisées plutôt dans les zones d’altitude intermédiaire basse, reflétant les observations plus rares qui ne sont pas localisées en altitude. 
+
+# Sauvegarde des cartes en fichiers SIG
+
+```{r}
+writeRaster(carte_finale,
+            "outputs/carte_papillons_indicemoy.tif", overwrite = TRUE)
+writeRaster(carte_incertitude,
+            "outputs/carte_papillons_incertitude.tif", overwrite = TRUE)
+writeRaster(carte_indice,
+            "outputs/carte_papillons_potentielhabitat.tif", overwrite = TRUE)
+
+```
